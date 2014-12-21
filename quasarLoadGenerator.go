@@ -6,9 +6,13 @@ import (
 	"math/rand"
 	"net"
 	"runtime"
+	"sync"
 	"time"
 	capnp "github.com/glycerine/go-capnproto"
 )
+
+var pointsInserted uint64
+var pointsLock sync.Mutex = sync.Mutex{}
 
 func pushRandomPoints(connection net.Conn, uuid []byte, id uint64, responseChan chan int) {
 	var segment *capnp.Segment = capnp.NewBuffer(nil)
@@ -51,38 +55,66 @@ func pushRandomPoints(connection net.Conn, uuid []byte, id uint64, responseChan 
 		if sendErr != nil {
 			fmt.Printf("Error in sending request: %v\n", sendErr)
 			return
-		}		
+		}
+
+		//fmt.Printf("Sent message\n")
+
 		responseSegment, respErr = capnp.ReadFromStream(connection, nil)
 		if respErr != nil {
 			fmt.Printf("Error in receiving response: %v\n", respErr)
 			return
 		}
+
+		//fmt.Printf("Received response\n")
 		
 		response = ReadRootResponse(responseSegment)
 		status = response.StatusCode()
-		if status != STATUSCODE_OK {
+		if status == STATUSCODE_OK {
+			pointsLock.Lock()
+			pointsInserted += 2
+			pointsLock.Unlock()
+		} else {
 			fmt.Printf("Quasar returns status code %s!\n", status)
 			responseChan <- 1
-		} else {
-			fmt.Printf("Quasar returns status code %s! ID: %v\n", status, id)
 		}
 	}
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	connection, err := net.Dial("tcp", "bunker.cs.berkeley.edu:4410")
-	defer connection.Close()
-	if err != nil {
-		fmt.Printf("Error in connecting: %v\n", err)
-		return
-	}
+	var (
+		connection net.Conn
+		err error
+	)
 	var i int
-	numThreads := runtime.NumCPU()
-	respChan := make(chan int);
+	numThreads := runtime.NumCPU() << 4
+	respChan := make(chan int)
 	for i = 0; i < numThreads; i++ {
+		connection, err = net.Dial("tcp", "bunker.cs.berkeley.edu:4410")
+		if err != nil {
+			fmt.Printf("Error in connecting: %v\n", err)
+			return
+		}
+		defer connection.Close()
 		go pushRandomPoints(connection, []byte("cd29a8e6-88b5-11e4-81a8-0026b6df9cf2"), uint64(i), respChan)
+		fmt.Printf("Started thread %v\n", i)
 	}
+
+    pointsLock.Lock()
+	fmt.Printf("%v points inserted during initialization\n", pointsInserted)
+	pointsInserted = 0
+	pointsLock.Unlock()
+	go func () { // prints out how many points were inserted in each second
+		for {
+			time.Sleep(time.Second)
+			pointsLock.Lock()
+			fmt.Printf("%v points inserted per second\n", pointsInserted);
+			pointsInserted = 0
+			pointsLock.Unlock()
+		}
+	}()
+
+	fmt.Println("Started daemon thread")
     
 	var threadResponse int
 	for threadResponse != 1 {
