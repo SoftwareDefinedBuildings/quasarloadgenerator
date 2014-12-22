@@ -8,24 +8,21 @@ import (
 	"sync"
 	"time"
 	capnp "github.com/glycerine/go-capnproto"
+	uuid "code.google.com/p/go-uuid/uuid"
 )
 
 const (
 	TOTAL_RECORDS = -1
-	NUM_THREADS = 1
 	TCP_CONNECTIONS = 1
 	POINTS_PER_MESSAGE = 2
-	NANOS_BETWEEN_POINTS = 1
+	NANOS_BETWEEN_POINTS = 9000000
 	DB_ADDR = "bunker.cs.berkeley.edu:4410"
+	NUM_STREAMS = 100
 )
 
 var (
 	FIRST_TIME = time.Now().UnixNano()
-	UUID = []byte("7fb5707c-894b-11e4-b60a-0026b6df9cf2")
 )
-
-var outstanding map[uint64]int64 = make(map[uint64]int64)
-var mapLock sync.Mutex = sync.Mutex{}
 
 var points_sent uint32 = 0
 var sentLock sync.Mutex = sync.Mutex{}
@@ -47,7 +44,6 @@ var messagePool sync.Pool = sync.Pool{
 		var seg *capnp.Segment = capnp.NewBuffer(nil)
 		var req Request = NewRootRequest(seg)
 		var insert CmdInsertValues = NewCmdInsertValues(seg)
-		insert.SetUuid(UUID)
 		insert.SetSync(false)
 		var recList Record_List = NewRecordList(seg, POINTS_PER_MESSAGE)
 		var pointList capnp.PointerList = capnp.PointerList(recList)
@@ -67,73 +63,67 @@ func get_time_value (time int64) float64 {
 	return math.Sin(float64(time))
 }
 
-func send_one_message(start int64, connection net.Conn, id uint64, comm chan int, sendLock *sync.Mutex) {
-	var mp MessagePart = messagePool.Get().(MessagePart)
-	defer messagePool.Put(mp)
-
-	segment := mp.segment
-	request := *mp.request
-	insert := *mp.insert
-	recordList := *mp.recordList
-	pointerList := *mp.pointerList
-	record := *mp.record
-
-	request.SetEchoTag(id)
-
+func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, recvLock *sync.Mutex) {
+	var id uint64 = 0
 	var time int64 = start
-	for i := 0; i < POINTS_PER_MESSAGE; i++ {
-		record.SetTime(time)
-		record.SetValue(get_time_value(time))
-		pointerList.Set(i, capnp.Object(record))
-		time += NANOS_BETWEEN_POINTS
-	}
-	insert.SetValues(recordList)
-	request.SetInsertValues(insert)
-	
-	mapLock.Lock()
-	outstanding[id] = start
-	mapLock.Unlock()
+	for {
+		var mp MessagePart = messagePool.Get().(MessagePart)
+		
+		segment := mp.segment
+		request := *mp.request
+		insert := *mp.insert
+		recordList := *mp.recordList
+		pointerList := *mp.pointerList
+		record := *mp.record
+		
+		request.SetEchoTag(id)
+		insert.SetUuid(uuid)
+		fmt.Println(string(uuid))
+		
+		for i := 0; i < POINTS_PER_MESSAGE; i++ {
+			record.SetTime(time)
+			record.SetValue(get_time_value(time))
+			pointerList.Set(i, capnp.Object(record))
+			time += NANOS_BETWEEN_POINTS
+		}
+		insert.SetValues(recordList)
+		request.SetInsertValues(insert)
+		
+		var sendErr error
+		
+		(*sendLock).Lock()
+		_, sendErr = segment.WriteTo(connection)
+		(*sendLock).Unlock()
 
-	var sendErr error
+		messagePool.Put(mp)
+		
+		if sendErr != nil {
+			fmt.Printf("Error in sending request: %v\n", sendErr)
+			return
+		}
+		sentLock.Lock()
+		points_sent += POINTS_PER_MESSAGE
+		sentLock.Unlock()
 
-	(*sendLock).Lock()
-	_, sendErr = segment.WriteTo(connection)
-	(*sendLock).Lock()
-
-	if sendErr != nil {
-		fmt.Printf("Error in sending request: %v\n", sendErr)
-		mapLock.Lock()
-		delete(outstanding, id)
-		mapLock.Unlock()
-		comm <- 1
-		return
-	}
-	sentLock.Lock()
-	points_sent += POINTS_PER_MESSAGE
-	sentLock.Unlock()
-	comm <- 0
-}
-
-func receive_one_message(connection net.Conn, recvLock *sync.Mutex) {
-	(*recvLock).Lock()
-	responseSegment, respErr := capnp.ReadFromStream(connection, nil)
-	(*recvLock).Unlock()
-
-	if respErr != nil {
-		fmt.Printf("Error in receiving response: %v\n", respErr)
-		return
-	}
-	
-	response := ReadRootResponse(responseSegment)
-	status := response.StatusCode()
-	if status == STATUSCODE_OK {
-		id := response.EchoTag()
-		delete(outstanding, id)
-		recvLock.Lock()
-		points_received += POINTS_PER_MESSAGE
-		recvLock.Unlock()
-	} else {
-		fmt.Printf("Quasar returns status code %s!\n", status)
+		(*recvLock).Lock()
+		responseSegment, respErr := capnp.ReadFromStream(connection, nil)
+		(*recvLock).Unlock()
+		
+		if respErr != nil {
+			fmt.Printf("Error in receiving response: %v\n", respErr)
+			return
+		}
+		
+		response := ReadRootResponse(responseSegment)
+		status := response.StatusCode()
+		if status == STATUSCODE_OK {
+			recvLock.Lock()
+			points_received += POINTS_PER_MESSAGE
+			recvLock.Unlock()
+		} else {
+			fmt.Printf("Quasar returns status code %s!\n", status)
+		}
+		id++
 	}
 }
 
@@ -153,45 +143,27 @@ func main() {
 			recvLocks[i] = &sync.Mutex{}
 		} else {
 			fmt.Printf("Could not connect to database: %s\n", err)
-			return
+			//return
 		}
 	}
 	fmt.Println("Finished creating connections")
 
-	recv := make(chan int, NUM_THREADS)
-	for j := 0; j < NUM_THREADS; j++ {
-		recv <- 0
+	var connIndex int = 0
+	
+	for j := 0; j < NUM_STREAMS; j++ {
+		go send_messages([]byte(uuid.NewUUID().String()), FIRST_TIME, connections[connIndex], sendLocks[connIndex], recvLocks[connIndex])
+		connIndex = (connIndex + 1) % TCP_CONNECTIONS
 	}
 
-	go func () { // Set up a goroutine to repeatedly print stats
-		for {
-			time.Sleep(time.Second)
-			sentLock.Lock()
-			fmt.Printf("Sent %v, ", points_sent)
-			points_sent = 0
-			sentLock.Unlock()
-			recvLock.Lock()
-			fmt.Printf("Received %v\n", points_received)
-			points_received = 0
-			recvLock.Unlock()
-		}
-	}()
-
-	var sig int
-	var connIndex int = 0
-	var sendID uint64 = 0
-	var pointTime int64 = FIRST_TIME
-
 	for {
-		sig = <-recv
-		if sig == 0 {
-			go send_one_message(pointTime, connections[connIndex], sendID, recv, sendLocks[connIndex])
-			go receive_one_message(connections[connIndex], recvLocks[connIndex])
-			pointTime += POINTS_PER_MESSAGE * NANOS_BETWEEN_POINTS
-			connIndex = (connIndex + 1) % TCP_CONNECTIONS
-			sendID++
-		} else {
-			break
-		}
+		time.Sleep(time.Second)
+		sentLock.Lock()
+		fmt.Printf("Sent %v, ", points_sent)
+		points_sent = 0
+		sentLock.Unlock()
+		recvLock.Lock()
+		fmt.Printf("Received %v\n", points_received)
+		points_received = 0
+		recvLock.Unlock()
 	}
 }
