@@ -12,9 +12,9 @@ import (
 )
 
 const (
-	TOTAL_RECORDS = -1
+	TOTAL_RECORDS = 100000
 	TCP_CONNECTIONS = 5
-	POINTS_PER_MESSAGE = 3
+	POINTS_PER_MESSAGE = 1000
 	NANOS_BETWEEN_POINTS = 9000000
 	DB_ADDR = "localhost:4410"
 	NUM_STREAMS = 100
@@ -71,7 +71,7 @@ func min64 (x1 int64, x2 int64) int64 {
 	}
 }
 
-func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connLock *sync.Mutex) {
+func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connLock *sync.Mutex, connID int, response chan int) {
 	var id uint64 = 0
 	var time int64 = start
 	var endTime int64
@@ -132,6 +132,7 @@ func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync
 		
 		if respErr != nil {
 			fmt.Printf("Error in receiving response: %v\n", respErr)
+			response <- -1
 			return
 		}
 		
@@ -146,6 +147,7 @@ func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync
 		}
 		id++
 	}
+	response <- connID
 }
 
 func main() {
@@ -159,7 +161,6 @@ func main() {
 		connections[i], err = net.Dial("tcp", DB_ADDR)
 		if err == nil {
 			fmt.Printf("Created connection %v\n", i)
-			defer connections[i].Close()
 			sendLocks[i] = &sync.Mutex{}
 			recvLocks[i] = &sync.Mutex{}
 		} else {
@@ -170,21 +171,56 @@ func main() {
 	fmt.Println("Finished creating connections")
 
 	var connIndex int = 0
+
+	var sig chan int = make(chan int)
+	var usingConn []int = make([]int, TCP_CONNECTIONS)
 	
 	for j := 0; j < NUM_STREAMS; j++ {
-		go send_messages([]byte(uuid.NewRandom()), FIRST_TIME, connections[connIndex], sendLocks[connIndex], recvLocks[connIndex])
+		go send_messages([]byte(uuid.NewRandom()), FIRST_TIME, connections[connIndex], sendLocks[connIndex], recvLocks[connIndex], connIndex, sig)
+		usingConn[connIndex]++
 		connIndex = (connIndex + 1) % TCP_CONNECTIONS
 	}
 
-	for {
-		time.Sleep(time.Second)
-		sentLock.Lock()
-		fmt.Printf("Sent %v, ", points_sent)
-		points_sent = 0
-		sentLock.Unlock()
-		recvLock.Lock()
-		fmt.Printf("Received %v\n", points_received)
-		points_received = 0
-		recvLock.Unlock()
+	go func () {
+		for {
+			time.Sleep(time.Second)
+			sentLock.Lock()
+			recvLock.Lock()
+			fmt.Printf("Sent %v, ", points_sent)
+			points_sent = 0
+			fmt.Printf("Received %v\n", points_received)
+			points_received = 0
+			recvLock.Unlock()
+			sentLock.Unlock()
+		}
+	}()
+
+	var response int
+	for k := 0; k < NUM_STREAMS; k++ {
+		response = <-sig
+		if response < 0 {
+			for m := 0; m < TCP_CONNECTIONS; m++ {
+				if usingConn[m] != 0 {
+					connections[m].Close()
+				}
+			}
+			break
+		} else {
+			usingConn[response]--
+			if usingConn[response] == 0 {
+				connections[response].Close()
+				fmt.Printf("Closed connection %v\n", response)
+			}
+		}
 	}
+
+	for k := NUM_STREAMS; k < TCP_CONNECTIONS; k++ {
+		connections[k].Close()
+		fmt.Printf("Closed connection %v\n", k)
+	}
+
+	sentLock.Lock()
+	recvLock.Lock()
+	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
+	fmt.Println("Finished")
 }
