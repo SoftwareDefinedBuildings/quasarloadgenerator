@@ -13,10 +13,10 @@ import (
 
 const (
 	TOTAL_RECORDS = -1
-	TCP_CONNECTIONS = 1
-	POINTS_PER_MESSAGE = 2
+	TCP_CONNECTIONS = 5
+	POINTS_PER_MESSAGE = 3
 	NANOS_BETWEEN_POINTS = 9000000
-	DB_ADDR = "bunker.cs.berkeley.edu:4410"
+	DB_ADDR = "localhost:4410"
 	NUM_STREAMS = 100
 )
 
@@ -60,13 +60,28 @@ var messagePool sync.Pool = sync.Pool{
 }
 
 func get_time_value (time int64) float64 {
-	return math.Sin(float64(time))
+	return math.Sqrt(float64(time))
 }
 
-func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, recvLock *sync.Mutex) {
+func min64 (x1 int64, x2 int64) int64 {
+	if x1 < x2 {
+		return x1
+	} else {
+		return x2
+	}
+}
+
+func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connLock *sync.Mutex) {
 	var id uint64 = 0
 	var time int64 = start
-	for {
+	var endTime int64
+	var numPoints uint32 = POINTS_PER_MESSAGE
+	if TOTAL_RECORDS < 0 {
+		endTime = 0x7FFFFFFFFFFFFFFF
+	} else {
+		endTime = min64(start + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
+	}
+	for time < endTime {
 		var mp MessagePart = messagePool.Get().(MessagePart)
 		
 		segment := mp.segment
@@ -78,9 +93,15 @@ func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync
 		
 		request.SetEchoTag(id)
 		insert.SetUuid(uuid)
-		fmt.Println(string(uuid))
-		
-		for i := 0; i < POINTS_PER_MESSAGE; i++ {
+
+		if endTime - time < POINTS_PER_MESSAGE * NANOS_BETWEEN_POINTS {
+			numPoints = uint32((endTime - time) / NANOS_BETWEEN_POINTS)
+			recordList = NewRecordList(segment, int(numPoints))
+			pointerList = capnp.PointerList(recordList)
+		}
+
+		var i int
+		for i = 0; uint32(i) < numPoints; i++ {
 			record.SetTime(time)
 			record.SetValue(get_time_value(time))
 			pointerList.Set(i, capnp.Object(record))
@@ -102,12 +123,12 @@ func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync
 			return
 		}
 		sentLock.Lock()
-		points_sent += POINTS_PER_MESSAGE
+		points_sent += uint32(numPoints)
 		sentLock.Unlock()
 
-		(*recvLock).Lock()
+		(*connLock).Lock()
 		responseSegment, respErr := capnp.ReadFromStream(connection, nil)
-		(*recvLock).Unlock()
+		(*connLock).Unlock()
 		
 		if respErr != nil {
 			fmt.Printf("Error in receiving response: %v\n", respErr)
@@ -118,7 +139,7 @@ func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync
 		status := response.StatusCode()
 		if status == STATUSCODE_OK {
 			recvLock.Lock()
-			points_received += POINTS_PER_MESSAGE
+			points_received += numPoints
 			recvLock.Unlock()
 		} else {
 			fmt.Printf("Quasar returns status code %s!\n", status)
@@ -143,7 +164,7 @@ func main() {
 			recvLocks[i] = &sync.Mutex{}
 		} else {
 			fmt.Printf("Could not connect to database: %s\n", err)
-			//return
+			return
 		}
 	}
 	fmt.Println("Finished creating connections")
@@ -151,7 +172,7 @@ func main() {
 	var connIndex int = 0
 	
 	for j := 0; j < NUM_STREAMS; j++ {
-		go send_messages([]byte(uuid.NewUUID().String()), FIRST_TIME, connections[connIndex], sendLocks[connIndex], recvLocks[connIndex])
+		go send_messages([]byte(uuid.NewRandom()), FIRST_TIME, connections[connIndex], sendLocks[connIndex], recvLocks[connIndex])
 		connIndex = (connIndex + 1) % TCP_CONNECTIONS
 	}
 
