@@ -6,18 +6,19 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 	capnp "github.com/glycerine/go-capnproto"
 	uuid "code.google.com/p/go-uuid/uuid"
 )
 
 const (
-	TOTAL_RECORDS = 100000
-	TCP_CONNECTIONS = 5
-	POINTS_PER_MESSAGE = 1000
+	TOTAL_RECORDS = 100
+	TCP_CONNECTIONS = 1
+	POINTS_PER_MESSAGE = 11
 	NANOS_BETWEEN_POINTS = 9000000
 	DB_ADDR = "localhost:4410"
-	NUM_STREAMS = 100
+	NUM_STREAMS = 1
 )
 
 var (
@@ -25,10 +26,8 @@ var (
 )
 
 var points_sent uint32 = 0
-var sentLock sync.Mutex = sync.Mutex{}
 
 var points_received uint32 = 0
-var recvLock sync.Mutex = sync.Mutex{}
 
 type MessagePart struct {
 	segment *capnp.Segment
@@ -122,9 +121,7 @@ func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync
 			fmt.Printf("Error in sending request: %v\n", sendErr)
 			return
 		}
-		sentLock.Lock()
-		points_sent += uint32(numPoints)
-		sentLock.Unlock()
+		atomic.AddUint32(&points_sent, uint32(numPoints))
 
 		(*connLock).Lock()
 		responseSegment, respErr := capnp.ReadFromStream(connection, nil)
@@ -139,9 +136,7 @@ func send_messages(uuid []byte, start int64, connection net.Conn, sendLock *sync
 		response := ReadRootResponse(responseSegment)
 		status := response.StatusCode()
 		if status == STATUSCODE_OK {
-			recvLock.Lock()
-			points_received += numPoints
-			recvLock.Unlock()
+			atomic.AddUint32(&points_received, uint32(numPoints))
 		} else {
 			fmt.Printf("Quasar returns status code %s!\n", status)
 		}
@@ -184,14 +179,11 @@ func main() {
 	go func () {
 		for {
 			time.Sleep(time.Second)
-			sentLock.Lock()
-			recvLock.Lock()
 			fmt.Printf("Sent %v, ", points_sent)
-			points_sent = 0
+			atomic.StoreUint32(&points_sent, 0)
 			fmt.Printf("Received %v\n", points_received)
+			atomic.StoreUint32(&points_received, 0)
 			points_received = 0
-			recvLock.Unlock()
-			sentLock.Unlock()
 		}
 	}()
 
@@ -219,8 +211,6 @@ func main() {
 		fmt.Printf("Closed connection %v\n", k)
 	}
 
-	sentLock.Lock()
-	recvLock.Lock()
 	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
 	fmt.Println("Finished")
 }
