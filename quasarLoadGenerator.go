@@ -243,6 +243,7 @@ func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mu
 					atomic.AddUint32(&points_verified, uint32(1))
 				} else {
 					fmt.Printf("Expected (%v, %v), got (%v, %v)\n", recTime, expected, recTime, received);
+					os.Exit(1);
 				}
 			}
 		}
@@ -354,9 +355,6 @@ func main() {
 	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
 	if (VERIFY_RESPONSES) {
 		fmt.Printf("%v points are verified to be correct\n", points_verified);
-	} else {
-		fmt.Printf("Points were not correct\n");
-		os.Exit(1);
 	}
 	
 	fmt.Println("Finished")
