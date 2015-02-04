@@ -243,7 +243,7 @@ func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mu
 					atomic.AddUint32(&points_verified, uint32(1))
 				} else {
 					fmt.Printf("Expected (%v, %v), got (%v, %v)\n", recTime, expected, recTime, received);
-					os.Exit(1);
+					os.Exit(1)
 				}
 			}
 		}
