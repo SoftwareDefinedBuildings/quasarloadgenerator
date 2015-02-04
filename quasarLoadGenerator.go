@@ -300,7 +300,7 @@ func main() {
 			recvLocks[i] = &sync.Mutex{}
 		} else {
 			fmt.Printf("Could not connect to database: %s\n", err)
-			return
+			os.Exit(1);
 		}
 	}
 	fmt.Println("Finished creating connections")
@@ -354,6 +354,10 @@ func main() {
 	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
 	if (VERIFY_RESPONSES) {
 		fmt.Printf("%v points are verified to be correct\n", points_verified);
+	} else {
+		fmt.Printf("Points were not correct\n");
+		os.Exit(1);
 	}
+	
 	fmt.Println("Finished")
 }
