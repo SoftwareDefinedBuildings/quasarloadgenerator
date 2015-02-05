@@ -3,24 +3,28 @@ package main
 import (
 	"fmt"
 	"math"
+	"io/ioutil"
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	cparse "github.com/SoftwareDefinedBuildings/sync2_quasar/configparser"
+	cpint "github.com/SoftwareDefinedBuildings/quasar/cpinterface"
 	capnp "github.com/glycerine/go-capnproto"
 	uuid "code.google.com/p/go-uuid/uuid"
 )
 
-const (
-	TOTAL_RECORDS = 100000
-	TCP_CONNECTIONS = 2
-	POINTS_PER_MESSAGE = 11
-	NANOS_BETWEEN_POINTS = 9000000
-	DB_ADDR = "localhost:4410"
-	NUM_STREAMS = 2
-	FIRST_TIME = int64(100000000000000)
+var (
+	TOTAL_RECORDS int64
+	TCP_CONNECTIONS int
+	POINTS_PER_MESSAGE uint32
+	NANOS_BETWEEN_POINTS int64
+	DB_ADDR string
+	NUM_STREAMS int
+    FIRST_TIME int64
 )
 
 var (
@@ -35,22 +39,22 @@ var points_verified uint32 = 0
 
 type InsertMessagePart struct {
 	segment *capnp.Segment
-	request *Request
-	insert *CmdInsertValues
-	recordList *Record_List
+	request *cpint.Request
+	insert *cpint.CmdInsertValues
+	recordList *cpint.Record_List
 	pointerList *capnp.PointerList
-	record *Record
+	record *cpint.Record
 }
 
 var insertPool sync.Pool = sync.Pool{
 	New: func () interface{} {
 		var seg *capnp.Segment = capnp.NewBuffer(nil)
-		var req Request = NewRootRequest(seg)
-		var insert CmdInsertValues = NewCmdInsertValues(seg)
+		var req cpint.Request = cpint.NewRootRequest(seg)
+		var insert cpint.CmdInsertValues = cpint.NewCmdInsertValues(seg)
 		insert.SetSync(false)
-		var recList Record_List = NewRecordList(seg, POINTS_PER_MESSAGE)
+		var recList cpint.Record_List = cpint.NewRecordList(seg, int(POINTS_PER_MESSAGE))
 		var pointList capnp.PointerList = capnp.PointerList(recList)
-		var record Record = NewRecord(seg)
+		var record cpint.Record = cpint.NewRecord(seg)
 		return InsertMessagePart{
 			segment: seg,
 			request: &req,
@@ -63,7 +67,7 @@ var insertPool sync.Pool = sync.Pool{
 }
 
 func get_time_value (time int64) float64 {
-	return math.Sin(float64(time))
+	return math.Sin(float64(time) / 1000000000)
 }
 
 func min64 (x1 int64, x2 int64) int64 {
@@ -97,9 +101,9 @@ func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.M
 		request.SetEchoTag(id)
 		insert.SetUuid(uuid)
 
-		if endTime - time < POINTS_PER_MESSAGE * NANOS_BETWEEN_POINTS {
+		if endTime - time < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
 			numPoints = uint32((endTime - time) / NANOS_BETWEEN_POINTS)
-			recordList = NewRecordList(segment, int(numPoints))
+			recordList = cpint.NewRecordList(segment, int(numPoints))
 			pointerList = capnp.PointerList(recordList)
 		}
 
@@ -137,9 +141,9 @@ func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.M
 			return
 		}
 		
-		response := ReadRootResponse(responseSegment)
+		response := cpint.ReadRootResponse(responseSegment)
 		status := response.StatusCode()
-		if status == STATUSCODE_OK {
+		if status == cpint.STATUSCODE_OK {
 			atomic.AddUint32(&points_received, uint32(numPoints))
 		} else {
 			fmt.Printf("Quasar returns status code %s!\n", status)
@@ -151,15 +155,15 @@ func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.M
 
 type QueryMessagePart struct {
 	segment *capnp.Segment
-	request *Request
-	query *CmdQueryStandardValues
+	request *cpint.Request
+	query *cpint.CmdQueryStandardValues
 }
 
 var queryPool sync.Pool = sync.Pool{
 	New: func () interface{} {
 		var seg *capnp.Segment = capnp.NewBuffer(nil)
-		var req Request = NewRootRequest(seg)
-		var query CmdQueryStandardValues = NewCmdQueryStandardValues(seg)
+		var req cpint.Request = cpint.NewRootRequest(seg)
+		var query cpint.CmdQueryStandardValues = cpint.NewCmdQueryStandardValues(seg)
 		query.SetVersion(0)
 		return QueryMessagePart{
 			segment: seg,
@@ -189,7 +193,7 @@ func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mu
 		request.SetEchoTag(id)
 		query.SetUuid(uuid)
 		query.SetStartTime(time)
-		if endTime - time < POINTS_PER_MESSAGE * NANOS_BETWEEN_POINTS {
+		if endTime - time < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
 			numPoints = uint32((endTime - time) / NANOS_BETWEEN_POINTS)
 		}
 		time += NANOS_BETWEEN_POINTS * int64(numPoints)
@@ -221,9 +225,9 @@ func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mu
 			return
 		}
 		
-		response := ReadRootResponse(responseSegment)
+		response := cpint.ReadRootResponse(responseSegment)
 		status := response.StatusCode()
-		if status == STATUSCODE_OK {
+		if status == cpint.STATUSCODE_OK {
 			atomic.AddUint32(&points_received, uint32(numPoints))
 		} else {
 			fmt.Printf("Quasar returns status code %s!\n", status)
@@ -252,10 +256,24 @@ func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mu
 	response <- connID
 }
 
+func getIntFromConfig(key string, config map[string]interface{}) int64 {
+    elem, ok := config[key]
+    if !ok {
+        fmt.Printf("Could not read %v from config file\n", key)
+        os.Exit(1)
+    }
+    intval, err := strconv.ParseInt(elem.(string), 0, 64)
+    if err != nil {
+        fmt.Printf("Could not parse %v to an int64: %v\n", elem, err)
+        os.Exit(1)
+    }
+    return intval
+}
+
+
 func main() {
 	args := os.Args[1:]
 	var send_messages func([]byte, int64, net.Conn, *sync.Mutex, *sync.Mutex, int, chan int)
-	var uuids [][]byte = make([][]byte, NUM_STREAMS);
 
 	if len(args) > 0 && args[0] == "-i" {
 		fmt.Println("Insert mode");
@@ -271,6 +289,36 @@ func main() {
 		fmt.Println("Usage: use -i to insert data and -q to query data. To query data and verify the response, use the -v flag instead of the -q flag.");
 		return
 	}
+	
+	/* Read the configuration file. */
+	
+	configfile, err := ioutil.ReadFile("loadConfig.ini")
+	if err != nil {
+	    fmt.Printf("Could not read loadConfig.ini: %v\n", err)
+	    return
+	}
+	
+	config, isErr := cparse.ParseConfig(string(configfile))
+    if isErr {
+        fmt.Println("There were errors while parsing loadConfig.ini. See above.")
+        return
+    }
+    
+    TOTAL_RECORDS = getIntFromConfig("TOTAL_RECORDS", config)
+    TCP_CONNECTIONS = int(getIntFromConfig("TCP_CONNECTIONS", config))
+    POINTS_PER_MESSAGE = uint32(getIntFromConfig("POINTS_PER_MESSAGE", config))
+    NANOS_BETWEEN_POINTS = getIntFromConfig("NANOS_BETWEEN_POINTS", config)
+    NUM_STREAMS = int(getIntFromConfig("NUM_STREAMS", config))
+    FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
+    
+    addr, ok := config["DB_ADDR"]
+    if !ok {
+        fmt.Println("Could not read DB_ADDR from config file")
+        os.Exit(1)
+    }
+    DB_ADDR = addr.(string)
+    
+    var uuids [][]byte = make([][]byte, NUM_STREAMS);
 
 	var j int = 0
 	for j = 0; j < len(args) - 1; j++ {
@@ -290,7 +338,7 @@ func main() {
 	var connections []net.Conn = make([]net.Conn, TCP_CONNECTIONS)
 	var sendLocks []*sync.Mutex = make([]*sync.Mutex, TCP_CONNECTIONS)
 	var recvLocks []*sync.Mutex = make([]*sync.Mutex, TCP_CONNECTIONS)
-	var err error
+	
 	fmt.Println("Creating connections...")
 	for i := range connections {
 		connections[i], err = net.Dial("tcp", DB_ADDR)
