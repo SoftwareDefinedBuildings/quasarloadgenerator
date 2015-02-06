@@ -319,16 +319,29 @@ func main() {
     }
     DB_ADDR = addr.(string)
     
-    var uuids [][]byte = make([][]byte, NUM_STREAMS);
-
-	var j int = 0
-	for j = 0; j < len(args) - 1; j++ {
-		uuids[j] = uuid.Parse(args[j + 1]);
-	}
-	for j < NUM_STREAMS {
-		uuids[j] = []byte(uuid.NewRandom())
-		j++
-	}
+    var uuids [][]byte = make([][]byte, NUM_STREAMS)
+    
+    var j int = 0
+    var uuidStr interface{}
+    var uuidParsed uuid.UUID
+    for true {
+        uuidStr, ok = config[fmt.Sprintf("UUID%v", j + 1)]
+        if !ok {
+            break
+        }
+        uuidParsed = uuid.Parse(uuidStr.(string))
+        if uuidParsed == nil {
+            fmt.Printf("Invalid UUID %v\n", uuidStr)
+            os.Exit(1)
+        }
+        uuids[j] = []byte(uuidParsed)
+        j = j + 1
+    }
+    if j != NUM_STREAMS {
+        fmt.Println("The number of specified UUIDs must equal NUM_STREAMS.")
+        fmt.Printf("%v UUIDs were specified, but NUM_STREAMS = %v\n", j, NUM_STREAMS)
+        os.Exit(1)
+    }
 	fmt.Printf("Using UUIDs ")
 	for j = 0; j < NUM_STREAMS; j++ {
 		fmt.Printf("%s ", uuid.UUID(uuids[j]).String())
