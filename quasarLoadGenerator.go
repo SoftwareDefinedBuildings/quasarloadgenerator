@@ -27,7 +27,7 @@ var (
 	NUM_STREAMS int
     FIRST_TIME int64
     RAND_SEED int64
-    
+    MAX_TIME_RANDOM_OFFSET float64
 )
 
 var (
@@ -70,6 +70,7 @@ var insertPool sync.Pool = sync.Pool{
 }
 
 func get_time_value (time int64, randGen *rand.Rand) float64 {
+	// We technically don't need time anymore, but if we switch back to a sine wave later it's useful to keep it around as a parameter
 	return randGen.NormFloat64()
 }
 
@@ -113,7 +114,7 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 
 		var i int
 		for i = 0; uint32(i) < numPoints; i++ {
-			record.SetTime(time)
+			record.SetTime(time + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET))
 			record.SetValue(get_time_value(time, randGen))
 			pointerList.Set(i, capnp.Object(record))
 			time += NANOS_BETWEEN_POINTS
@@ -218,10 +219,11 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 	response <- connID
 }
 
-func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64) {
+func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, pass *bool) {
     for true {
         /* I've restructured the code so that this is the only goroutine that receives from the connection.
-           So, the locks aren't necessary anymore. */
+           So, the locks aren't necessary anymore. But, I've kept the lock around in case we switch to a different
+           design later on. */
         //(*connLock).Lock()
 	    responseSegment, respErr := capnp.ReadFromStream(connection, nil)
 	    //(*connLock).Unlock()
@@ -246,8 +248,9 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 	    }
 
 	    if VERIFY_RESPONSES {
+   		    var randGen *rand.Rand = randGens[id]
 	    	var currTime int64 = times[id]
-	    	var expTime int64 = currTime
+	    	var expTime int64
 		    records := responseSeg.Records().Values()
 		    var num_records uint32 = uint32(records.Len())
 		    var expected float64 = 0
@@ -255,17 +258,20 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		    var recTime int64 = 0
 		    if num_records != numPoints {
 		    	fmt.Printf("Expected %v points in query response, but got %v points instead.\n", numPoints, num_records)
+		    	*pass = false
 		    }
 		    for m := 0; uint32(m) < num_records; m++ {
 			    received = records.At(m).Value()
 			    recTime = records.At(m).Time()
+			    expTime = currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
 			    expected = get_time_value(recTime, randGens[id])
 			    if expTime == recTime && received == expected {
 				    atomic.AddUint32(&points_verified, uint32(1))
 			    } else {
 				    fmt.Printf("Expected (%v, %v), got (%v, %v)\n", expTime, expected, recTime, received)
+				    *pass = false
 			    }
-			    expTime = expTime + NANOS_BETWEEN_POINTS
+			    currTime = currTime + NANOS_BETWEEN_POINTS
 		    }
 	    }
 	    channel <- 0
@@ -327,6 +333,24 @@ func main() {
     NUM_STREAMS = int(getIntFromConfig("NUM_STREAMS", config))
     FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
     RAND_SEED = getIntFromConfig("RAND_SEED", config)
+    var timeRandOffset int64 = getIntFromConfig("MAX_TIME_RANDOM_OFFSET", config)
+    if (TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0) {
+    	fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, and NUM_STREAMS must be positive.")
+    	os.Exit(1)
+    }
+    if (timeRandOffset >= NANOS_BETWEEN_POINTS) {
+    	fmt.Println("MAX_TIME_RANDOM_OFFSET must be less than NANOS_BETWEEN_POINTS.")
+    	os.Exit(1)
+    }
+    if (timeRandOffset > (1 << 53)) { // must be exactly representable as a float64
+    	fmt.Println("MAX_TIME_RANDOM_OFFSET is too large: the maximum value is 2 ^ 53.")
+    	os.Exit(1)
+    }
+    if (timeRandOffset <= 0) {
+    	fmt.Println("MAX_TIME_RANDOM_OFFSET must be nonnegative.")
+    	os.Exit(1)
+    }
+    MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
     
     var seedGen *rand.Rand = rand.New(rand.NewSource(RAND_SEED))
     var randGens []*rand.Rand = make([]*rand.Rand, NUM_STREAMS)
@@ -406,8 +430,10 @@ func main() {
 		connIndex = (connIndex + 1) % TCP_CONNECTIONS
 	}
 	
+	var verification_test_pass bool = true
+	
 	for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
-	    go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes)
+	    go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes, &verification_test_pass)
 	}
 	
 	/* Handle ^C */
@@ -452,7 +478,7 @@ func main() {
 			}
 		}
 	}
-
+	
 	for k := NUM_STREAMS; k < TCP_CONNECTIONS; k++ {
 		connections[k].Close()
 		fmt.Printf("Closed connection %v\n", k)
@@ -461,7 +487,13 @@ func main() {
 	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
 	if (VERIFY_RESPONSES) {
 		fmt.Printf("%v points are verified to be correct\n", points_verified);
+		if verification_test_pass {
+			fmt.Println("All points were verified to be correct. Test PASSes.")
+		} else {
+			fmt.Println("Some points were found to be incorrect. Test FAILs.")
+			os.Exit(1) // terminate with a non-zero exit code
+		}
+	} else {
+		fmt.Println("Finished")
 	}
-	
-	fmt.Println("Finished")
 }
