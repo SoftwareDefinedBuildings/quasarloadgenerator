@@ -2,10 +2,11 @@ package main
 
 import (
 	"fmt"
-	"math"
+	"math/rand"
 	"io/ioutil"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"sync"
@@ -25,6 +26,8 @@ var (
 	DB_ADDR string
 	NUM_STREAMS int
     FIRST_TIME int64
+    RAND_SEED int64
+    
 )
 
 var (
@@ -66,8 +69,8 @@ var insertPool sync.Pool = sync.Pool{
 	},
 }
 
-func get_time_value (time int64) float64 {
-	return math.Sin(float64(time) / 1000000000)
+func get_time_value (time int64, randGen *rand.Rand) float64 {
+	return randGen.NormFloat64()
 }
 
 func min64 (x1 int64, x2 int64) int64 {
@@ -78,16 +81,18 @@ func min64 (x1 int64, x2 int64) int64 {
 	}
 }
 
-func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32) {
-	var time int64 = start
+func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32, randGen *rand.Rand) {
+	var time int64 = *start
 	var endTime int64
 	var numPoints uint32 = POINTS_PER_MESSAGE
 	if TOTAL_RECORDS < 0 {
 		endTime = 0x7FFFFFFFFFFFFFFF
 	} else {
-		endTime = min64(start + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
+		endTime = min64(time + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
 	}
 	for time < endTime {
+		*start = time // update this so that we can verify the times that are inserted
+		
 		var mp InsertMessagePart = insertPool.Get().(InsertMessagePart)
 		
 		segment := mp.segment
@@ -109,7 +114,7 @@ func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.M
 		var i int
 		for i = 0; uint32(i) < numPoints; i++ {
 			record.SetTime(time)
-			record.SetValue(get_time_value(time))
+			record.SetValue(get_time_value(time, randGen))
 			pointerList.Set(i, capnp.Object(record))
 			time += NANOS_BETWEEN_POINTS
 		}
@@ -160,16 +165,18 @@ var queryPool sync.Pool = sync.Pool{
 	},
 }
 
-func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32) {
-	var time int64 = start
+func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32, randGen *rand.Rand) {
+	var time int64 = *start
 	var endTime int64
 	var numPoints uint32 = POINTS_PER_MESSAGE
 	if TOTAL_RECORDS < 0 {
 		endTime = 0x7FFFFFFFFFFFFFFF
 	} else {
-		endTime = min64(start + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
+		endTime = min64(time + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
 	}
 	for time < endTime {
+		*start = time
+	
 		var mp QueryMessagePart = queryPool.Get().(QueryMessagePart)
 		
 		segment := mp.segment
@@ -211,7 +218,7 @@ func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mu
 	response <- connID
 }
 
-func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32) {
+func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64) {
     for true {
         /* I've restructured the code so that this is the only goroutine that receives from the connection.
            So, the locks aren't necessary anymore. */
@@ -239,21 +246,26 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 	    }
 
 	    if VERIFY_RESPONSES {
+	    	var currTime int64 = times[id]
+	    	var expTime int64 = currTime
 		    records := responseSeg.Records().Values()
 		    var num_records uint32 = uint32(records.Len())
 		    var expected float64 = 0
 		    var received float64 = 0
 		    var recTime int64 = 0
+		    if num_records != numPoints {
+		    	fmt.Printf("Expected %v points in query response, but got %v points instead.\n", numPoints, num_records)
+		    }
 		    for m := 0; uint32(m) < num_records; m++ {
 			    received = records.At(m).Value()
 			    recTime = records.At(m).Time()
-			    expected = get_time_value(recTime)
-			    if received == expected {
+			    expected = get_time_value(recTime, randGens[id])
+			    if expTime == recTime && received == expected {
 				    atomic.AddUint32(&points_verified, uint32(1))
 			    } else {
-				    fmt.Printf("Expected (%v, %v), got (%v, %v)\n", recTime, expected, recTime, received);
-				    os.Exit(1)
+				    fmt.Printf("Expected (%v, %v), got (%v, %v)\n", expTime, expected, recTime, received)
 			    }
+			    expTime = expTime + NANOS_BETWEEN_POINTS
 		    }
 	    }
 	    channel <- 0
@@ -277,7 +289,7 @@ func getIntFromConfig(key string, config map[string]interface{}) int64 {
 
 func main() {
 	args := os.Args[1:]
-	var send_messages func([]byte, int64, net.Conn, *sync.Mutex, int, chan int, int, chan uint32)
+	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, int, chan int, int, chan uint32, *rand.Rand)
 
 	if len(args) > 0 && args[0] == "-i" {
 		fmt.Println("Insert mode");
@@ -314,6 +326,10 @@ func main() {
     NANOS_BETWEEN_POINTS = getIntFromConfig("NANOS_BETWEEN_POINTS", config)
     NUM_STREAMS = int(getIntFromConfig("NUM_STREAMS", config))
     FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
+    RAND_SEED = getIntFromConfig("RAND_SEED", config)
+    
+    var seedGen *rand.Rand = rand.New(rand.NewSource(RAND_SEED))
+    var randGens []*rand.Rand = make([]*rand.Rand, NUM_STREAMS)
     
     addr, ok := config["DB_ADDR"]
     if !ok {
@@ -376,18 +392,36 @@ func main() {
 	var usingConn []int = make([]int, TCP_CONNECTIONS)
 	var idToChannel []chan uint32 = make([]chan uint32, NUM_STREAMS)
 	var cont chan uint32
+	var randGen *rand.Rand
+	var startTimes []int64 = make([]int64, NUM_STREAMS)
 	
 	for z := 0; z < NUM_STREAMS; z++ {
 	    cont = make(chan uint32)
 	    idToChannel[z] = cont
-		go send_messages(uuids[z], FIRST_TIME, connections[connIndex], sendLocks[connIndex], connIndex, sig, z, cont)
+	    randGen = rand.New(rand.NewSource(seedGen.Int63()))
+	    randGens[z] = randGen
+	    startTimes[z] = FIRST_TIME
+		go send_messages(uuids[z], &startTimes[z], connections[connIndex], sendLocks[connIndex], connIndex, sig, z, cont, randGen)
 		usingConn[connIndex]++
 		connIndex = (connIndex + 1) % TCP_CONNECTIONS
 	}
 	
 	for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
-	    go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel)
+	    go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes)
 	}
+	
+	/* Handle ^C */
+	interrupt := make(chan os.Signal)
+	signal.Notify(interrupt, os.Interrupt)
+    go func() {
+		<-interrupt // block until an interrupt happens
+		fmt.Println("\nDetected ^C. Abruptly ending program...")
+		fmt.Println("The following are the start times of the messages that are currently being inserted/queried:")
+		for i := 0; i < NUM_STREAMS; i++ {
+			fmt.Printf("%v: %v\n", uuid.UUID(uuids[i]).String(), startTimes[i])
+		}
+		os.Exit(0)
+    }()
 
 	go func () {
 		for {
