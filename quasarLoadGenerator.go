@@ -78,8 +78,7 @@ func min64 (x1 int64, x2 int64) int64 {
 	}
 }
 
-func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connLock *sync.Mutex, connID int, response chan int) {
-	var id uint64 = 0
+func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32) {
 	var time int64 = start
 	var endTime int64
 	var numPoints uint32 = POINTS_PER_MESSAGE
@@ -98,7 +97,7 @@ func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.M
 		pointerList := *mp.pointerList
 		record := *mp.record
 		
-		request.SetEchoTag(id)
+		request.SetEchoTag(uint64(streamID))
 		insert.SetUuid(uuid)
 
 		if endTime - time < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
@@ -130,25 +129,13 @@ func insert_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.M
 			return
 		}
 		atomic.AddUint32(&points_sent, uint32(numPoints))
+		
+		cont <- numPoints
 
-		(*connLock).Lock()
-		responseSegment, respErr := capnp.ReadFromStream(connection, nil)
-		(*connLock).Unlock()
-		
-		if respErr != nil {
-			fmt.Printf("Error in receiving response: %v\n", respErr)
-			response <- -1
-			return
+		if <-cont == 1 {
+		    fmt.Println("Error in receiving response")
+		    os.Exit(1)
 		}
-		
-		response := cpint.ReadRootResponse(responseSegment)
-		status := response.StatusCode()
-		if status == cpint.STATUSCODE_OK {
-			atomic.AddUint32(&points_received, uint32(numPoints))
-		} else {
-			fmt.Printf("Quasar returns status code %s!\n", status)
-		}
-		id++
 	}
 	response <- connID
 }
@@ -173,8 +160,7 @@ var queryPool sync.Pool = sync.Pool{
 	},
 }
 
-func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connLock *sync.Mutex, connID int, response chan int) {
-	var id uint64 = 0
+func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32) {
 	var time int64 = start
 	var endTime int64
 	var numPoints uint32 = POINTS_PER_MESSAGE
@@ -190,7 +176,7 @@ func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mu
 		request := *mp.request
 		query := *mp.query
 		
-		request.SetEchoTag(id)
+		request.SetEchoTag(uint64(streamID))
 		query.SetUuid(uuid)
 		query.SetStartTime(time)
 		if endTime - time < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
@@ -211,50 +197,67 @@ func query_data(uuid []byte, start int64, connection net.Conn, sendLock *sync.Mu
 		
 		if sendErr != nil {
 			fmt.Printf("Error in sending request: %v\n", sendErr)
-			return
+			os.Exit(1)
 		}
 		atomic.AddUint32(&points_sent, uint32(numPoints))
 
-		(*connLock).Lock()
-		responseSegment, respErr := capnp.ReadFromStream(connection, nil)
-		(*connLock).Unlock()
-		
-		if respErr != nil {
-			fmt.Printf("Error in receiving response: %v\n", respErr)
-			response <- -1
-			return
-		}
-		
-		response := cpint.ReadRootResponse(responseSegment)
-		status := response.StatusCode()
-		if status == cpint.STATUSCODE_OK {
-			atomic.AddUint32(&points_received, uint32(numPoints))
-		} else {
-			fmt.Printf("Quasar returns status code %s!\n", status)
-		}
+		cont <- numPoints
 
-		if VERIFY_RESPONSES {
-			records := response.Records().Values()
-			var num_records uint32 = uint32(records.Len())
-			var expected float64 = 0
-			var received float64 = 0
-			var recTime int64 = 0
-			for m := 0; uint32(m) < num_records; m++ {
-				received = records.At(m).Value()
-				recTime = records.At(m).Time()
-				expected = get_time_value(recTime)
-				if received == expected {
-					atomic.AddUint32(&points_verified, uint32(1))
-				} else {
-					fmt.Printf("Expected (%v, %v), got (%v, %v)\n", recTime, expected, recTime, received);
-					os.Exit(1)
-				}
-			}
+		if <-cont == 1 {
+		    fmt.Println("Error in receiving response")
+		    os.Exit(1)
 		}
-
-		id++
 	}
 	response <- connID
+}
+
+func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32) {
+    for true {
+        /* I've restructured the code so that this is the only goroutine that receives from the connection.
+           So, the locks aren't necessary anymore. */
+        //(*connLock).Lock()
+	    responseSegment, respErr := capnp.ReadFromStream(connection, nil)
+	    //(*connLock).Unlock()
+	
+	    if respErr != nil {
+		    fmt.Printf("Error in receiving response: %v\n", respErr)
+		    os.Exit(1)
+	    }
+	
+	    responseSeg := cpint.ReadRootResponse(responseSegment)
+	    id := responseSeg.EchoTag()
+	    status := responseSeg.StatusCode()
+	    
+	    var channel chan uint32 = idToChannel[id]
+	    var numPoints uint32 = <-channel
+	    
+	    if status == cpint.STATUSCODE_OK {
+		    atomic.AddUint32(&points_received, numPoints)
+	    } else {
+		    fmt.Printf("Quasar returns status code %s!\n", status)
+		    channel <- 1
+	    }
+
+	    if VERIFY_RESPONSES {
+		    records := responseSeg.Records().Values()
+		    var num_records uint32 = uint32(records.Len())
+		    var expected float64 = 0
+		    var received float64 = 0
+		    var recTime int64 = 0
+		    for m := 0; uint32(m) < num_records; m++ {
+			    received = records.At(m).Value()
+			    recTime = records.At(m).Time()
+			    expected = get_time_value(recTime)
+			    if received == expected {
+				    atomic.AddUint32(&points_verified, uint32(1))
+			    } else {
+				    fmt.Printf("Expected (%v, %v), got (%v, %v)\n", recTime, expected, recTime, received);
+				    os.Exit(1)
+			    }
+		    }
+	    }
+	    channel <- 0
+	}
 }
 
 func getIntFromConfig(key string, config map[string]interface{}) int64 {
@@ -274,7 +277,7 @@ func getIntFromConfig(key string, config map[string]interface{}) int64 {
 
 func main() {
 	args := os.Args[1:]
-	var send_messages func([]byte, int64, net.Conn, *sync.Mutex, *sync.Mutex, int, chan int)
+	var send_messages func([]byte, int64, net.Conn, *sync.Mutex, int, chan int, int, chan uint32)
 
 	if len(args) > 0 && args[0] == "-i" {
 		fmt.Println("Insert mode");
@@ -371,11 +374,19 @@ func main() {
 
 	var sig chan int = make(chan int)
 	var usingConn []int = make([]int, TCP_CONNECTIONS)
+	var idToChannel []chan uint32 = make([]chan uint32, NUM_STREAMS)
+	var cont chan uint32
 	
 	for z := 0; z < NUM_STREAMS; z++ {
-		go send_messages(uuids[z], FIRST_TIME, connections[connIndex], sendLocks[connIndex], recvLocks[connIndex], connIndex, sig)
+	    cont = make(chan uint32)
+	    idToChannel[z] = cont
+		go send_messages(uuids[z], FIRST_TIME, connections[connIndex], sendLocks[connIndex], connIndex, sig, z, cont)
 		usingConn[connIndex]++
 		connIndex = (connIndex + 1) % TCP_CONNECTIONS
+	}
+	
+	for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
+	    go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel)
 	}
 
 	go func () {
