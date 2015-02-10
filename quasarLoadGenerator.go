@@ -556,7 +556,9 @@ func main() {
 		fmt.Printf("Closed connection %v\n", k)
 	}
 
-	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
+    if !DELETE_POINTS {
+    	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
+    }
 	if (VERIFY_RESPONSES) {
 		fmt.Printf("%v points are verified to be correct\n", points_verified);
 		if verification_test_pass {
