@@ -278,6 +278,68 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 	}
 }
 
+type DeleteMessagePart struct {
+	segment *capnp.Segment
+	request *cpint.Request
+	query *cpint.CmdDeleteValues
+}
+
+var deletePool sync.Pool = sync.Pool{
+	New: func () interface{} {
+		var seg *capnp.Segment = capnp.NewBuffer(nil)
+		var req cpint.Request = cpint.NewRootRequest(seg)
+		var query cpint.CmdDeleteValues = cpint.NewCmdDeleteValues(seg)
+		req.SetEchoTag(0)
+		return DeleteMessagePart{
+			segment: seg,
+			request: &req,
+			query: &query,
+		}
+	},
+}
+
+func delete_data(uuid []byte, connection net.Conn, sendLock *sync.Mutex, recvLock *sync.Mutex, startTime int64, endTime int64, connID int, response chan int) {
+    var mp DeleteMessagePart = deletePool.Get().(DeleteMessagePart)
+    segment := *mp.segment
+    request := *mp.request
+    query := *mp.query
+    
+    query.SetUuid(uuid)
+    query.SetStartTime(startTime)
+    query.SetEndTime(endTime)
+    
+    request.SetDeleteValues(query)
+    
+    (*sendLock).Lock()
+    _, sendErr := segment.WriteTo(connection)
+    (*sendLock).Unlock()
+    
+    deletePool.Put(mp)
+    
+    if sendErr != nil {
+		fmt.Printf("Error in sending request: %v\n", sendErr)
+		os.Exit(1)
+	}
+    
+    (*recvLock).Lock()
+    responseSegment, respErr := capnp.ReadFromStream(connection, nil)
+    (*recvLock).Unlock()
+    
+    if respErr != nil {
+	    fmt.Printf("Error in receiving response: %v\n", respErr)
+	    os.Exit(1)
+    }
+
+    responseSeg := cpint.ReadRootResponse(responseSegment)
+    status := responseSeg.StatusCode()
+    
+    if status != cpint.STATUSCODE_OK {
+	    fmt.Printf("Quasar returns status code %s!\n", status)
+    }
+    
+    response <- connID
+}
+
 func getIntFromConfig(key string, config map[string]interface{}) int64 {
     elem, ok := config[key]
     if !ok {
@@ -296,7 +358,8 @@ func getIntFromConfig(key string, config map[string]interface{}) int64 {
 func main() {
 	args := os.Args[1:]
 	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, int, chan int, int, chan uint32, *rand.Rand)
-
+    var DELETE_POINTS bool = false
+    
 	if len(args) > 0 && args[0] == "-i" {
 		fmt.Println("Insert mode");
 		send_messages = insert_data
@@ -307,8 +370,11 @@ func main() {
 		fmt.Println("Query mode with verification");
 		send_messages = query_data
 		VERIFY_RESPONSES = true
+	} else if len(args) > 0 && args[0] == "-d" {
+	    fmt.Println("Delete mode")
+	    DELETE_POINTS = true
 	} else {
-		fmt.Println("Usage: use -i to insert data and -q to query data. To query data and verify the response, use the -v flag instead of the -q flag.");
+		fmt.Println("Usage: use -i to insert data and -q to query data. To query data and verify the response, use the -v flag instead of the -q flag. Use the -d flag to delete data.");
 		return
 	}
 	
@@ -418,47 +484,53 @@ func main() {
 	var cont chan uint32
 	var randGen *rand.Rand
 	var startTimes []int64 = make([]int64, NUM_STREAMS)
+    var verification_test_pass bool = true
 	
-	for z := 0; z < NUM_STREAMS; z++ {
-	    cont = make(chan uint32)
-	    idToChannel[z] = cont
-	    randGen = rand.New(rand.NewSource(seedGen.Int63()))
-	    randGens[z] = randGen
-	    startTimes[z] = FIRST_TIME
-		go send_messages(uuids[z], &startTimes[z], connections[connIndex], sendLocks[connIndex], connIndex, sig, z, cont, randGen)
-		usingConn[connIndex]++
-		connIndex = (connIndex + 1) % TCP_CONNECTIONS
-	}
+	if DELETE_POINTS {
+	    for g := 0; g < NUM_STREAMS; g++ {
+	        go delete_data(uuids[g], connections[connIndex], sendLocks[connIndex], recvLocks[connIndex], FIRST_TIME, FIRST_TIME + NANOS_BETWEEN_POINTS * TOTAL_RECORDS, connIndex, sig)
+	        connIndex = (connIndex + 1) % TCP_CONNECTIONS
+	    }
+	} else {
+	    for z := 0; z < NUM_STREAMS; z++ {
+	        cont = make(chan uint32)
+	        idToChannel[z] = cont
+	        randGen = rand.New(rand.NewSource(seedGen.Int63()))
+	        randGens[z] = randGen
+	        startTimes[z] = FIRST_TIME
+		    go send_messages(uuids[z], &startTimes[z], connections[connIndex], sendLocks[connIndex], connIndex, sig, z, cont, randGen)
+		    usingConn[connIndex]++
+		    connIndex = (connIndex + 1) % TCP_CONNECTIONS
+	    }
 	
-	var verification_test_pass bool = true
+	    for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
+	        go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes, &verification_test_pass)
+	    }
 	
-	for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
-	    go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes, &verification_test_pass)
-	}
-	
-	/* Handle ^C */
-	interrupt := make(chan os.Signal)
-	signal.Notify(interrupt, os.Interrupt)
-    go func() {
-		<-interrupt // block until an interrupt happens
-		fmt.Println("\nDetected ^C. Abruptly ending program...")
-		fmt.Println("The following are the start times of the messages that are currently being inserted/queried:")
-		for i := 0; i < NUM_STREAMS; i++ {
-			fmt.Printf("%v: %v\n", uuid.UUID(uuids[i]).String(), startTimes[i])
-		}
-		os.Exit(0)
-    }()
+	    /* Handle ^C */
+	    interrupt := make(chan os.Signal)
+	    signal.Notify(interrupt, os.Interrupt)
+        go func() {
+		    <-interrupt // block until an interrupt happens
+		    fmt.Println("\nDetected ^C. Abruptly ending program...")
+		    fmt.Println("The following are the start times of the messages that are currently being inserted/queried:")
+		    for i := 0; i < NUM_STREAMS; i++ {
+			    fmt.Printf("%v: %v\n", uuid.UUID(uuids[i]).String(), startTimes[i])
+		    }
+		    os.Exit(0)
+        }()
 
-	go func () {
-		for {
-			time.Sleep(time.Second)
-			fmt.Printf("Sent %v, ", points_sent)
-			atomic.StoreUint32(&points_sent, 0)
-			fmt.Printf("Received %v\n", points_received)
-			atomic.StoreUint32(&points_received, 0)
-			points_received = 0
-		}
-	}()
+	    go func () {
+		    for {
+			    time.Sleep(time.Second)
+			    fmt.Printf("Sent %v, ", points_sent)
+			    atomic.StoreUint32(&points_sent, 0)
+			    fmt.Printf("Received %v\n", points_received)
+			    atomic.StoreUint32(&points_received, 0)
+			    points_received = 0
+		    }
+	    }()
+	}
 
 	var response int
 	for k := 0; k < NUM_STREAMS; k++ {
