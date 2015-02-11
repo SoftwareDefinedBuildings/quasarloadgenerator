@@ -219,7 +219,7 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 	response <- connID
 }
 
-func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, pass *bool) {
+func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, pass *bool, numUsing *int) {
     for true {
         /* I've restructured the code so that this is the only goroutine that receives from the connection.
            So, the locks aren't necessary anymore. But, I've kept the lock around in case we switch to a different
@@ -227,6 +227,10 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
         //(*connLock).Lock()
 	    responseSegment, respErr := capnp.ReadFromStream(connection, nil)
 	    //(*connLock).Unlock()
+	    
+	    if *numUsing == 0 {
+	        return
+	    }
 	
 	    if respErr != nil {
 		    fmt.Printf("Error in receiving response: %v\n", respErr)
@@ -433,7 +437,7 @@ func main() {
 	var verification_test_pass bool = true
 	
 	for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
-	    go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes, &verification_test_pass)
+	    go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes, &verification_test_pass, &usingConn[connIndex])
 	}
 	
 	/* Handle ^C */
