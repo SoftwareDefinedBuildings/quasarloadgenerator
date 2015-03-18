@@ -91,9 +91,7 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 	} else {
 		endTime = min64(time + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
 	}
-	for time < endTime {
-		*start = time // update this so that we can verify the times that are inserted
-		
+	for time < endTime {		
 		var mp InsertMessagePart = insertPool.Get().(InsertMessagePart)
 		
 		segment := mp.segment
@@ -111,6 +109,8 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 			recordList = cpint.NewRecordList(segment, int(numPoints))
 			pointerList = capnp.PointerList(recordList)
 		}
+		
+		cont <- numPoints // Blocks if we haven't received enough responses
 
 		var i int
 		for i = 0; uint32(i) < numPoints; i++ {
@@ -124,9 +124,9 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 		
 		var sendErr error
 		
-		(*sendLock).Lock()
+		sendLock.Lock()
 		_, sendErr = segment.WriteTo(connection)
-		(*sendLock).Unlock()
+		sendLock.Unlock()
 
 		insertPool.Put(mp)
 		
@@ -135,13 +135,6 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 			return
 		}
 		atomic.AddUint32(&points_sent, uint32(numPoints))
-		
-		cont <- numPoints
-
-		if <-cont == 1 {
-		    fmt.Println("Error in receiving response")
-		    os.Exit(1)
-		}
 	}
 	response <- connID
 }
@@ -176,8 +169,6 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 		endTime = min64(time + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
 	}
 	for time < endTime {
-		*start = time
-	
 		var mp QueryMessagePart = queryPool.Get().(QueryMessagePart)
 		
 		segment := mp.segment
@@ -190,6 +181,9 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 		if endTime - time < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
 			numPoints = uint32((endTime - time) / NANOS_BETWEEN_POINTS)
 		}
+		
+		cont <- numPoints // Blocks if we haven't received enough responses
+		
 		time += NANOS_BETWEEN_POINTS * int64(numPoints)
 		query.SetEndTime(time)
 
@@ -197,9 +191,9 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 
 		var sendErr error
 		
-		(*sendLock).Lock()
+		sendLock.Lock()
 		_, sendErr = segment.WriteTo(connection)
-		(*sendLock).Unlock()
+		sendLock.Unlock()
 
 		queryPool.Put(mp)
 		
@@ -208,13 +202,6 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 			os.Exit(1)
 		}
 		atomic.AddUint32(&points_sent, uint32(numPoints))
-
-		cont <- numPoints
-
-		if <-cont == 1 {
-		    fmt.Println("Error in receiving response")
-		    os.Exit(1)
-		}
 	}
 	response <- connID
 }
@@ -242,13 +229,14 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 	    status := responseSeg.StatusCode()
 	    
 	    var channel chan uint32 = idToChannel[id]
+	    
 	    var numPoints uint32 = <-channel
 	    
 	    if status == cpint.STATUSCODE_OK {
 		    atomic.AddUint32(&points_received, numPoints)
 	    } else {
 		    fmt.Printf("Quasar returns status code %s!\n", status)
-		    channel <- 1
+		    os.Exit(1);
 	    }
 
 	    if VERIFY_RESPONSES {
@@ -277,8 +265,8 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 			    }
 			    currTime = currTime + NANOS_BETWEEN_POINTS
 		    }
+		    times[id] = currTime;
 	    }
-	    channel <- 0
 	}
 }
 
@@ -403,9 +391,10 @@ func main() {
     NUM_STREAMS = int(getIntFromConfig("NUM_STREAMS", config))
     FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
     RAND_SEED = getIntFromConfig("RAND_SEED", config)
+    var maxConcurrentMessages int64 = getIntFromConfig("MAX_CONCURRENT_MESSAGES", config);
     var timeRandOffset int64 = getIntFromConfig("MAX_TIME_RANDOM_OFFSET", config)
-    if (TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0) {
-    	fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, and NUM_STREAMS must be positive.")
+    if (TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0) {
+    	fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, NUM_STREAMS, and MAX_CONCURRENT_MESSAGES must be positive.")
     	os.Exit(1)
     }
     if (timeRandOffset >= NANOS_BETWEEN_POINTS) {
@@ -416,9 +405,13 @@ func main() {
     	fmt.Println("MAX_TIME_RANDOM_OFFSET is too large: the maximum value is 2 ^ 53.")
     	os.Exit(1)
     }
-    if (timeRandOffset <= 0) {
+    if (timeRandOffset < 0) {
     	fmt.Println("MAX_TIME_RANDOM_OFFSET must be nonnegative.")
     	os.Exit(1)
+    }
+    if (VERIFY_RESPONSES && maxConcurrentMessages > 1) {
+    	fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.");
+    	maxConcurrentMessages = 1;
     }
     MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
     
@@ -497,7 +490,7 @@ func main() {
 	    }
 	} else {
 	    for z := 0; z < NUM_STREAMS; z++ {
-	        cont = make(chan uint32)
+	        cont = make(chan uint32, maxConcurrentMessages)
 	        idToChannel[z] = cont
 	        randGen = rand.New(rand.NewSource(seedGen.Int63()))
 	        randGens[z] = randGen
