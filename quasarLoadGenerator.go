@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"time"
 	cparse "github.com/SoftwareDefinedBuildings/sync2_quasar/configparser"
 	cpint "github.com/SoftwareDefinedBuildings/quasar/cpinterface"
 	capnp "github.com/glycerine/go-capnproto"
@@ -25,18 +24,14 @@ var (
 	NANOS_BETWEEN_POINTS int64
 	DB_ADDR string
 	NUM_STREAMS int
-    FIRST_TIME int64
-    RAND_SEED int64
-    MAX_TIME_RANDOM_OFFSET float64
+	FIRST_TIME int64
+	RAND_SEED int64
+	MAX_TIME_RANDOM_OFFSET float64
 )
 
 var (
 	VERIFY_RESPONSES = false
 )
-
-var points_sent uint32 = 0
-
-var points_received uint32 = 0
 
 var points_verified uint32 = 0
 
@@ -134,7 +129,6 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 			fmt.Printf("Error in sending request: %v\n", sendErr)
 			return
 		}
-		atomic.AddUint32(&points_sent, uint32(numPoints))
 	}
 	response <- connID
 }
@@ -201,7 +195,6 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 			fmt.Printf("Error in sending request: %v\n", sendErr)
 			os.Exit(1)
 		}
-		atomic.AddUint32(&points_sent, uint32(numPoints))
 	}
 	response <- connID
 }
@@ -211,9 +204,9 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
         /* I've restructured the code so that this is the only goroutine that receives from the connection.
            So, the locks aren't necessary anymore. But, I've kept the lock around in case we switch to a different
            design later on. */
-        //(*connLock).Lock()
+        //connLock.Lock()
 	    responseSegment, respErr := capnp.ReadFromStream(connection, nil)
-	    //(*connLock).Unlock()
+	    //connLock.Unlock()
 	    
 	    if *numUsing == 0 {
 	        return
@@ -232,9 +225,7 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 	    
 	    var numPoints uint32 = <-channel
 	    
-	    if status == cpint.STATUSCODE_OK {
-		    atomic.AddUint32(&points_received, numPoints)
-	    } else {
+	    if status != cpint.STATUSCODE_OK {
 		    fmt.Printf("Quasar returns status code %s!\n", status)
 		    os.Exit(1);
 	    }
@@ -302,9 +293,9 @@ func delete_data(uuid []byte, connection net.Conn, sendLock *sync.Mutex, recvLoc
     
     request.SetDeleteValues(query)
     
-    (*sendLock).Lock()
+    sendLock.Lock()
     _, sendErr := segment.WriteTo(connection)
-    (*sendLock).Unlock()
+    sendLock.Unlock()
     
     deletePool.Put(mp)
     
@@ -313,9 +304,9 @@ func delete_data(uuid []byte, connection net.Conn, sendLock *sync.Mutex, recvLoc
 		os.Exit(1)
 	}
     
-    (*recvLock).Lock()
+    recvLock.Lock()
     responseSegment, respErr := capnp.ReadFromStream(connection, nil)
-    (*recvLock).Unlock()
+    recvLock.Unlock()
     
     if respErr != nil {
 	    fmt.Printf("Error in receiving response: %v\n", respErr)
@@ -516,17 +507,6 @@ func main() {
 		    }
 		    os.Exit(0)
         }()
-
-	    go func () {
-		    for {
-			    time.Sleep(time.Second)
-			    fmt.Printf("Sent %v, ", points_sent)
-			    atomic.StoreUint32(&points_sent, 0)
-			    fmt.Printf("Received %v\n", points_received)
-			    atomic.StoreUint32(&points_received, 0)
-			    points_received = 0
-		    }
-	    }()
 	}
 
 	var response int
@@ -553,9 +533,6 @@ func main() {
 		fmt.Printf("Closed connection %v\n", k)
 	}
 
-    if !DELETE_POINTS {
-    	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
-    }
 	if (VERIFY_RESPONSES) {
 		fmt.Printf("%v points are verified to be correct\n", points_verified);
 		if verification_test_pass {
