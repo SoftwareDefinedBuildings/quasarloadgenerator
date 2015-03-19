@@ -80,8 +80,12 @@ func getRandValue (time int64, randGen *rand.Rand) float64 {
 	return randGen.NormFloat64()
 }
 
+var sines [100]float64
+
+var sinesIndex = 100
 func getSinusoidValue (time int64, randGen *rand.Rand) float64 {
-    return math.Sin(0.000000120 * math.Pi * float64(time))
+    sinesIndex = (sinesIndex + 1) % 100;
+    return sines[sinesIndex];
 }
 
 func min64 (x1 int64, x2 int64) int64 {
@@ -461,6 +465,9 @@ func main() {
 	
 	if DETERMINISTIC_KV {
 		get_time_value = getSinusoidValue;
+		for r := 0; r < 100; r++ {
+			sines[r] = math.Sin(2 * math.Pi * float64(r) / 100)
+		}
 	} else {
 		get_time_value = getRandValue;
 	}
@@ -641,4 +648,5 @@ func main() {
 	}
 	fmt.Printf("Total time: %d nanoseconds for %d points\n", deltaT, TOTAL_RECORDS * int64(NUM_STREAMS))
 	fmt.Printf("Average: %d nanoseconds per point (floored to integer value)\n", deltaT / (TOTAL_RECORDS * int64(NUM_STREAMS)))
+	fmt.Println(deltaT)
 }
