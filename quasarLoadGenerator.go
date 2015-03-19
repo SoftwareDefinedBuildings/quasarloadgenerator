@@ -417,25 +417,29 @@ func main() {
 	PERM_SEED = getIntFromConfig("PERM_SEED", config)
 	var maxConcurrentMessages int64 = getIntFromConfig("MAX_CONCURRENT_MESSAGES", config);
 	var timeRandOffset int64 = getIntFromConfig("MAX_TIME_RANDOM_OFFSET", config)
-	if (TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0) {
+	if TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0 {
 		fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, NUM_STREAMS, and MAX_CONCURRENT_MESSAGES must be positive.")
 		os.Exit(1)
 	}
-	if (timeRandOffset >= NANOS_BETWEEN_POINTS) {
+	if timeRandOffset >= NANOS_BETWEEN_POINTS {
 		fmt.Println("MAX_TIME_RANDOM_OFFSET must be less than NANOS_BETWEEN_POINTS.")
 		os.Exit(1)
 	}
-	if (timeRandOffset > (1 << 53)) { // must be exactly representable as a float64
+	if timeRandOffset > (1 << 53) { // must be exactly representable as a float64
 		fmt.Println("MAX_TIME_RANDOM_OFFSET is too large: the maximum value is 2 ^ 53.")
 		os.Exit(1)
 	}
-	if (timeRandOffset < 0) {
+	if timeRandOffset < 0 {
 		fmt.Println("MAX_TIME_RANDOM_OFFSET must be nonnegative.")
 		os.Exit(1)
 	}
-	if (VERIFY_RESPONSES && maxConcurrentMessages > 1) {
+	if VERIFY_RESPONSES && maxConcurrentMessages > 1 {
 		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.");
 		maxConcurrentMessages = 1;
+	}
+	if VERIFY_RESPONSES && PERM_SEED != 0 {
+		fmt.Println("ERROR: PERM_SEED must be set to 0 when verifying responses.");
+		return;
 	}
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
 	
