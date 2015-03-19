@@ -526,6 +526,7 @@ func main() {
 	}
 	fmt.Println("Finished generating insert/query order");
 	
+	var startTime int64 = time.Now().UnixNano()
 	if DELETE_POINTS {
 		for g := 0; g < NUM_STREAMS; g++ {
 			go delete_data(uuids[g], connections[connIndex], sendLocks[connIndex], recvLocks[connIndex], FIRST_TIME, FIRST_TIME + NANOS_BETWEEN_POINTS * TOTAL_RECORDS, connIndex, sig)
@@ -591,11 +592,13 @@ func main() {
 		}
 	}
 	
+	var deltaT int64 = time.Now().UnixNano() - startTime
+	
 	for k := NUM_STREAMS; k < TCP_CONNECTIONS; k++ {
 		connections[k].Close()
 		fmt.Printf("Closed connection %v\n", k)
 	}
-
+    
 	if !DELETE_POINTS {
 		fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
 	}
@@ -610,4 +613,6 @@ func main() {
 	} else {
 		fmt.Println("Finished")
 	}
+	fmt.Printf("Total time: %d nanoseconds for %d points\n", deltaT, TOTAL_RECORDS * int64(NUM_STREAMS))
+	fmt.Printf("Average: %d nanoseconds per point (floored to integer value)\n", deltaT / (TOTAL_RECORDS * int64(NUM_STREAMS)))
 }
