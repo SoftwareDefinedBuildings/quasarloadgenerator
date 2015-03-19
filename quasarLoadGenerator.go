@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"io/ioutil"
 	"net"
@@ -28,6 +29,7 @@ var (
 	NUM_STREAMS int
 	FIRST_TIME int64
 	RAND_SEED int64
+	PERM_SEED int64
 	MAX_TIME_RANDOM_OFFSET float64
 )
 
@@ -83,16 +85,21 @@ func min64 (x1 int64, x2 int64) int64 {
 	}
 }
 
-func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32, randGen *rand.Rand) {
+func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages int64) {
 	var time int64 = *start
 	var endTime int64
-	var numPoints uint32 = POINTS_PER_MESSAGE
+	var numPoints uint32
 	if TOTAL_RECORDS < 0 {
 		endTime = 0x7FFFFFFFFFFFFFFF
 	} else {
 		endTime = min64(time + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
 	}
-	for time < endTime {		
+	var j int64
+	for j = 0; j < numMessages; j++ {
+		time = permutation[j]
+		
+		numPoints = POINTS_PER_MESSAGE
+			
 		var mp InsertMessagePart = insertPool.Get().(InsertMessagePart)
 		
 		segment := mp.segment
@@ -163,16 +170,21 @@ var queryPool sync.Pool = sync.Pool{
 	},
 }
 
-func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32, randGen *rand.Rand) {
+func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages int64) {
 	var time int64 = *start
 	var endTime int64
-	var numPoints uint32 = POINTS_PER_MESSAGE
+	var numPoints uint32
 	if TOTAL_RECORDS < 0 {
 		endTime = 0x7FFFFFFFFFFFFFFF
 	} else {
 		endTime = min64(time + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
 	}
-	for time < endTime {
+	var j int64
+	for j = 0; j < numMessages; j++ {
+	    time = permutation[j]
+	    
+	    numPoints = POINTS_PER_MESSAGE
+	    
 		var mp QueryMessagePart = queryPool.Get().(QueryMessagePart)
 		
 		segment := mp.segment
@@ -188,8 +200,7 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 		
 		cont <- numPoints // Blocks if we haven't received enough responses
 		
-		time += NANOS_BETWEEN_POINTS * int64(numPoints)
-		query.SetEndTime(time)
+		query.SetEndTime(time + NANOS_BETWEEN_POINTS * int64(numPoints))
 
 		var sendErr error
 		
@@ -213,9 +224,9 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		/* I've restructured the code so that this is the only goroutine that receives from the connection.
 		   So, the locks aren't necessary anymore. But, I've kept the lock around in case we switch to a different
 		   design later on. */
-		//(*connLock).Lock()
+		//connLock.Lock()
 		responseSegment, respErr := capnp.ReadFromStream(connection, nil)
-		//(*connLock).Unlock()
+		//connLock.Unlock()
 		
 		if *numUsing == 0 {
 			return
@@ -350,7 +361,7 @@ func getIntFromConfig(key string, config map[string]interface{}) int64 {
 
 func main() {
 	args := os.Args[1:]
-	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, int, chan int, int, chan uint32, *rand.Rand)
+	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, int, chan int, int, chan uint32, *rand.Rand, []int64, int64)
 	var DELETE_POINTS bool = false
 	
 	if len(args) > 0 && args[0] == "-i" {
@@ -403,6 +414,7 @@ func main() {
 	NUM_STREAMS = int(getIntFromConfig("NUM_STREAMS", config))
 	FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
 	RAND_SEED = getIntFromConfig("RAND_SEED", config)
+	PERM_SEED = getIntFromConfig("PERM_SEED", config)
 	var maxConcurrentMessages int64 = getIntFromConfig("MAX_CONCURRENT_MESSAGES", config);
 	var timeRandOffset int64 = getIntFromConfig("MAX_TIME_RANDOM_OFFSET", config)
 	if (TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0) {
@@ -428,6 +440,7 @@ func main() {
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
 	
 	var seedGen *rand.Rand = rand.New(rand.NewSource(RAND_SEED))
+	var permGen *rand.Rand = rand.New(rand.NewSource(PERM_SEED));
 	var randGens []*rand.Rand = make([]*rand.Rand, NUM_STREAMS)
 	
 	addr, ok := config["DB_ADDR"]
@@ -494,6 +507,24 @@ func main() {
 	var randGen *rand.Rand
 	var startTimes []int64 = make([]int64, NUM_STREAMS)
 	var verification_test_pass bool = true
+	var perm [][]int64 = make([][]int64, NUM_STREAMS)
+	
+	var perm_size = int64(math.Ceil(float64(TOTAL_RECORDS) / float64(POINTS_PER_MESSAGE)))
+	var f int64
+	for e := 0; e < NUM_STREAMS; e++ {
+		perm[e] = make([]int64, perm_size)
+	    if PERM_SEED == 0 {
+			for f = 0; f < perm_size; f++ {
+				perm[e][f] = FIRST_TIME + NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE) * f
+			}
+		} else {
+			x := permGen.Perm(int(perm_size))
+			for f = 0; f < perm_size; f++ {
+				perm[e][f] = FIRST_TIME + NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE) * int64(x[f])
+			}
+		}
+	}
+	fmt.Println("Finished generating insert/query order");
 	
 	if DELETE_POINTS {
 		for g := 0; g < NUM_STREAMS; g++ {
@@ -507,7 +538,7 @@ func main() {
 			randGen = rand.New(rand.NewSource(seedGen.Int63()))
 			randGens[z] = randGen
 			startTimes[z] = FIRST_TIME
-			go send_messages(uuids[z], &startTimes[z], connections[connIndex], sendLocks[connIndex], connIndex, sig, z, cont, randGen)
+			go send_messages(uuids[z], &startTimes[z], connections[connIndex], sendLocks[connIndex], connIndex, sig, z, cont, randGen, perm[z], perm_size)
 			usingConn[connIndex]++
 			connIndex = (connIndex + 1) % TCP_CONNECTIONS
 		}
