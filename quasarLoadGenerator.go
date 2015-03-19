@@ -31,6 +31,7 @@ var (
 	RAND_SEED int64
 	PERM_SEED int64
 	MAX_TIME_RANDOM_OFFSET float64
+	DETERMINISTIC_KV bool
 )
 
 var (
@@ -72,9 +73,15 @@ var insertPool sync.Pool = sync.Pool{
 	},
 }
 
-func get_time_value (time int64, randGen *rand.Rand) float64 {
+var get_time_value func (int64, *rand.Rand) float64
+
+func getRandValue (time int64, randGen *rand.Rand) float64 {
 	// We technically don't need time anymore, but if we switch back to a sine wave later it's useful to keep it around as a parameter
 	return randGen.NormFloat64()
+}
+
+func getSinusoidValue (time int64, randGen *rand.Rand) float64 {
+    return math.Sin(0.000000120 * math.Pi * float64(time))
 }
 
 func min64 (x1 int64, x2 int64) int64 {
@@ -124,7 +131,11 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 
 		var i int
 		for i = 0; uint32(i) < numPoints; i++ {
-			record.SetTime(time + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET))
+		    if DETERMINISTIC_KV {
+		    	record.SetTime(time)
+		    } else {
+				record.SetTime(time + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET))
+			}
 			record.SetValue(get_time_value(time, randGen))
 			pointerList.Set(i, capnp.Object(record))
 			time += NANOS_BETWEEN_POINTS
@@ -268,7 +279,11 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 			for m := 0; uint32(m) < num_records; m++ {
 				received = records.At(m).Value()
 				recTime = records.At(m).Time()
-				expTime = currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
+				if DETERMINISTIC_KV {
+					expTime = currTime
+				} else {
+					expTime = currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
+				}
 				expected = get_time_value(recTime, randGens[id])
 				if expTime == recTime && received == expected {
 					atomic.AddUint32(&points_verified, uint32(1))
@@ -437,11 +452,18 @@ func main() {
 		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.");
 		maxConcurrentMessages = 1;
 	}
-	if VERIFY_RESPONSES && PERM_SEED != 0 {
-		fmt.Println("ERROR: PERM_SEED must be set to 0 when verifying responses.");
+	if VERIFY_RESPONSES && PERM_SEED != 0 && !DETERMINISTIC_KV {
+		fmt.Println("ERROR: PERM_SEED must be set to 0 when verifying nondeterministic responses.");
 		return;
 	}
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
+	DETERMINISTIC_KV = (config["DETERMINISTIC_KV"].(string) == "true")
+	
+	if DETERMINISTIC_KV {
+		get_time_value = getSinusoidValue;
+	} else {
+		get_time_value = getRandValue;
+	}
 	
 	var seedGen *rand.Rand = rand.New(rand.NewSource(RAND_SEED))
 	var permGen *rand.Rand = rand.New(rand.NewSource(PERM_SEED));
