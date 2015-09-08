@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 	cparse "github.com/SoftwareDefinedBuildings/sync2_quasar/configparser"
-	cpint "github.com/SoftwareDefinedBuildings/quasar/cpinterface"
+	cpint "github.com/SoftwareDefinedBuildings/btrdb/cpinterface"
 	capnp "github.com/glycerine/go-capnproto"
 	uuid "code.google.com/p/go-uuid/uuid"
 )
