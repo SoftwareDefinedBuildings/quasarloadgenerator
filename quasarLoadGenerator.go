@@ -25,7 +25,7 @@ var (
 	TCP_CONNECTIONS int
 	POINTS_PER_MESSAGE uint32
 	NANOS_BETWEEN_POINTS int64
-	DB_ADDR string
+	NUM_SERVERS int
 	NUM_STREAMS int
 	FIRST_TIME int64
 	RAND_SEED int64
@@ -43,6 +43,11 @@ var points_sent uint32 = 0
 var points_received uint32 = 0
 
 var points_verified uint32 = 0
+
+type ConnectionID struct {
+    serverIndex int
+    connectionIndex int
+}
 
 type InsertMessagePart struct {
 	segment *capnp.Segment
@@ -96,7 +101,7 @@ func min64 (x1 int64, x2 int64) int64 {
 	}
 }
 
-func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages int64) {
+func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages int64) {
 	var time int64 = *start
 	var endTime int64
 	var numPoints uint32
@@ -185,7 +190,7 @@ var queryPool sync.Pool = sync.Pool{
 	},
 }
 
-func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID int, response chan int, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages int64) {
+func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages int64) {
 	var time int64 = *start
 	var endTime int64
 	var numPoints uint32
@@ -330,7 +335,7 @@ var deletePool sync.Pool = sync.Pool{
 	},
 }
 
-func delete_data(uuid []byte, connection net.Conn, sendLock *sync.Mutex, recvLock *sync.Mutex, startTime int64, endTime int64, connID int, response chan int) {
+func delete_data(uuid []byte, connection net.Conn, sendLock *sync.Mutex, recvLock *sync.Mutex, startTime int64, endTime int64, connID ConnectionID, response chan ConnectionID) {
 	var mp DeleteMessagePart = deletePool.Get().(DeleteMessagePart)
 	segment := *mp.segment
 	request := *mp.request
@@ -339,7 +344,6 @@ func delete_data(uuid []byte, connection net.Conn, sendLock *sync.Mutex, recvLoc
 	query.SetUuid(uuid)
 	query.SetStartTime(startTime)
 	query.SetEndTime(endTime)
-	
 	request.SetDeleteValues(query)
 	
 	(*sendLock).Lock()
@@ -386,9 +390,13 @@ func getIntFromConfig(key string, config map[string]interface{}) int64 {
 	return intval
 }
 
+func getServer(uuid []byte) int {
+	return int(uint(uuid[0]) % uint(NUM_SERVERS))
+}
+
 func main() {
 	args := os.Args[1:]
-	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, int, chan int, int, chan uint32, *rand.Rand, []int64, int64)
+	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, ConnectionID, chan ConnectionID, int, chan uint32, *rand.Rand, []int64, int64)
 	var DELETE_POINTS bool = false
 	
 	if len(args) > 0 && args[0] == "-i" {
@@ -438,6 +446,7 @@ func main() {
 	TCP_CONNECTIONS = int(getIntFromConfig("TCP_CONNECTIONS", config))
 	POINTS_PER_MESSAGE = uint32(getIntFromConfig("POINTS_PER_MESSAGE", config))
 	NANOS_BETWEEN_POINTS = getIntFromConfig("NANOS_BETWEEN_POINTS", config)
+	NUM_SERVERS = int(getIntFromConfig("NUM_SERVERS", config))
 	NUM_STREAMS = int(getIntFromConfig("NUM_STREAMS", config))
 	FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
 	RAND_SEED = getIntFromConfig("RAND_SEED", config)
@@ -484,19 +493,28 @@ func main() {
 	var permGen *rand.Rand = rand.New(rand.NewSource(PERM_SEED));
 	var randGens []*rand.Rand = make([]*rand.Rand, NUM_STREAMS)
 	
-	addr, ok := config["DB_ADDR"]
-	if !ok {
-		fmt.Println("Could not read DB_ADDR from config file")
+	var j int
+	var ok bool
+	var dbAddrStr interface{}
+	var dbAddrs []string = make([]string, NUM_SERVERS)
+	for j = 0; j < NUM_SERVERS; j++ {
+		dbAddrStr, ok = config[fmt.Sprintf("DB_ADDR%v", j + 1)]
+		if !ok {
+			break
+		}
+		dbAddrs[j] = dbAddrStr.(string)
+	}
+	_, ok = config[fmt.Sprintf("DB_ADDR%v", j + 1)]
+	if j != NUM_SERVERS || ok {
+		fmt.Println("The number of specified DB_ADDRs must equal NUM_SERVERS.")
 		os.Exit(1)
 	}
-	DB_ADDR = addr.(string)
 	
 	var uuids [][]byte = make([][]byte, NUM_STREAMS)
 	
-	var j int = 0
 	var uuidStr interface{}
 	var uuidParsed uuid.UUID
-	for true {
+	for j = 0; j < NUM_STREAMS; j++ {
 		uuidStr, ok = config[fmt.Sprintf("UUID%v", j + 1)]
 		if !ok {
 			break
@@ -507,11 +525,10 @@ func main() {
 			os.Exit(1)
 		}
 		uuids[j] = []byte(uuidParsed)
-		j = j + 1
 	}
-	if j != NUM_STREAMS {
+	_, ok = config[fmt.Sprintf("UUID%v", j + 1)]
+	if j != NUM_STREAMS || ok {
 		fmt.Println("The number of specified UUIDs must equal NUM_STREAMS.")
-		fmt.Printf("%v UUIDs were specified, but NUM_STREAMS = %v\n", j, NUM_STREAMS)
 		os.Exit(1)
 	}
 	fmt.Printf("Using UUIDs ")
@@ -521,28 +538,38 @@ func main() {
 	fmt.Printf("\n")
 	
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	var connections []net.Conn = make([]net.Conn, TCP_CONNECTIONS)
-	var sendLocks []*sync.Mutex = make([]*sync.Mutex, TCP_CONNECTIONS)
-	var recvLocks []*sync.Mutex = make([]*sync.Mutex, TCP_CONNECTIONS)
+	var connections [][]net.Conn = make([][]net.Conn, NUM_SERVERS)
+	var sendLocks [][]*sync.Mutex = make([][]*sync.Mutex, NUM_SERVERS)
+	var recvLocks [][]*sync.Mutex = make([][]*sync.Mutex, NUM_SERVERS)
 	
-	fmt.Println("Creating connections...")
-	for i := range connections {
-		connections[i], err = net.Dial("tcp", DB_ADDR)
-		if err == nil {
-			fmt.Printf("Created connection %v\n", i)
-			sendLocks[i] = &sync.Mutex{}
-			recvLocks[i] = &sync.Mutex{}
-		} else {
-			fmt.Printf("Could not connect to database: %s\n", err)
-			os.Exit(1);
+	for s := range dbAddrs {
+		fmt.Printf("Creating connections to %v...\n", dbAddrs[s])
+	    connections[s] = make([]net.Conn, TCP_CONNECTIONS)
+	    sendLocks[s] = make([]*sync.Mutex, TCP_CONNECTIONS)
+	    recvLocks[s] = make([]*sync.Mutex, TCP_CONNECTIONS)
+		for i := range connections[s] {
+			connections[s][i], err = net.Dial("tcp", dbAddrs[s])
+			if err == nil {
+				fmt.Printf("Created connection %v to %v\n", i, dbAddrs[s])
+				sendLocks[s][i] = &sync.Mutex{}
+				recvLocks[s][i] = &sync.Mutex{}
+			} else {
+				fmt.Printf("Could not connect to database: %s\n", err)
+				os.Exit(1);
+			}
 		}
 	}
 	fmt.Println("Finished creating connections")
 
-	var connIndex int = 0
+	var serverIndex int = 0
+	var streamCounts []int = make([]int, NUM_SERVERS)
+	var connIndex int
 
-	var sig chan int = make(chan int)
-	var usingConn []int = make([]int, TCP_CONNECTIONS)
+	var sig chan ConnectionID = make(chan ConnectionID)
+	var usingConn [][]int = make([][]int, NUM_SERVERS)
+	for y := 0; y < NUM_SERVERS; y++ {
+		usingConn[y] = make([]int, TCP_CONNECTIONS)
+	}
 	var idToChannel []chan uint32 = make([]chan uint32, NUM_STREAMS)
 	var cont chan uint32
 	var randGen *rand.Rand
@@ -576,8 +603,10 @@ func main() {
 	var startTime int64 = time.Now().UnixNano()
 	if DELETE_POINTS {
 		for g := 0; g < NUM_STREAMS; g++ {
-			go delete_data(uuids[g], connections[connIndex], sendLocks[connIndex], recvLocks[connIndex], FIRST_TIME, FIRST_TIME + NANOS_BETWEEN_POINTS * TOTAL_RECORDS, connIndex, sig)
-			connIndex = (connIndex + 1) % TCP_CONNECTIONS
+			serverIndex = getServer(uuids[g])
+			connIndex = streamCounts[serverIndex] % TCP_CONNECTIONS
+			go delete_data(uuids[g], connections[serverIndex][connIndex], sendLocks[serverIndex][connIndex], recvLocks[serverIndex][connIndex], FIRST_TIME, FIRST_TIME + NANOS_BETWEEN_POINTS * TOTAL_RECORDS, ConnectionID{serverIndex, connIndex}, sig)
+			streamCounts[serverIndex]++
 		}
 	} else {
 		for z := 0; z < NUM_STREAMS; z++ {
@@ -586,13 +615,17 @@ func main() {
 			randGen = rand.New(rand.NewSource(seedGen.Int63()))
 			randGens[z] = randGen
 			startTimes[z] = FIRST_TIME
-			go send_messages(uuids[z], &startTimes[z], connections[connIndex], sendLocks[connIndex], connIndex, sig, z, cont, randGen, perm[z], perm_size)
-			usingConn[connIndex]++
-			connIndex = (connIndex + 1) % TCP_CONNECTIONS
+			serverIndex = getServer(uuids[z])
+			connIndex = streamCounts[serverIndex] % TCP_CONNECTIONS
+			go send_messages(uuids[z], &startTimes[z], connections[serverIndex][connIndex], sendLocks[serverIndex][connIndex], ConnectionID{serverIndex, connIndex}, sig, z, cont, randGen, perm[z], perm_size)
+			usingConn[serverIndex][connIndex]++
+			streamCounts[serverIndex]++
 		}
 	
-		for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
-			go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes, pointsReceived, &verification_test_pass, &usingConn[connIndex])
+		for serverIndex = 0; serverIndex < NUM_SERVERS; serverIndex++ {
+			for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
+				go validateResponses(connections[serverIndex][connIndex], recvLocks[serverIndex][connIndex], idToChannel, randGens, startTimes, pointsReceived, &verification_test_pass, &usingConn[serverIndex][connIndex])
+			}
 		}
 		
 		/* Handle ^C */
@@ -620,31 +653,27 @@ func main() {
 		}()
 	}
 
-	var response int
+	var response ConnectionID
 	for k := 0; k < NUM_STREAMS; k++ {
 		response = <-sig
-		if response < 0 {
-			for m := 0; m < TCP_CONNECTIONS; m++ {
-				if usingConn[m] != 0 {
-					connections[m].Close()
-				}
-			}
-			break
-		} else {
-			usingConn[response]--
-			if usingConn[response] == 0 {
-				connections[response].Close()
-				fmt.Printf("Closed connection %v\n", response)
-			}
+	    serverIndex = response.serverIndex
+	    connIndex = response.connectionIndex
+		usingConn[serverIndex][connIndex]--
+		if usingConn[serverIndex][connIndex] == 0 {
+			connections[serverIndex][connIndex].Close()
+			fmt.Printf("Closed connection %v to server %v\n", connIndex, dbAddrs[serverIndex])
 		}
 	}
 	
 	var deltaT int64 = time.Now().UnixNano() - startTime
 	
+	// Close unused connections
+	/*
 	for k := NUM_STREAMS; k < TCP_CONNECTIONS; k++ {
 		connections[k].Close()
-		fmt.Printf("Closed connection %v\n", k)
+		fmt.Printf("Closed connection %v to server\n", k)
 	}
+	*/
     
 	if !DELETE_POINTS {
 		fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
