@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"io"
 	"io/ioutil"
 	"net"
 	"os"
@@ -32,6 +33,10 @@ var (
 	PERM_SEED int64
 	MAX_TIME_RANDOM_OFFSET float64
 	DETERMINISTIC_KV bool
+	GET_MESSAGE_TIMES bool
+	
+	orderBitlength uint
+	orderBitmask uint64
 )
 
 var (
@@ -44,9 +49,14 @@ var points_received uint32 = 0
 
 var points_verified uint32 = 0
 
+type TransactionData struct {
+	sendTime int64
+	respTime int64
+}
+
 type ConnectionID struct {
-    serverIndex int
-    connectionIndex int
+	serverIndex int
+	connectionIndex int
 }
 
 type InsertMessagePart struct {
@@ -89,8 +99,8 @@ var sines [100]float64
 
 var sinesIndex = 100
 func getSinusoidValue (time int64, randGen *rand.Rand) float64 {
-    sinesIndex = (sinesIndex + 1) % 100;
-    return sines[sinesIndex];
+	sinesIndex = (sinesIndex + 1) % 100;
+	return sines[sinesIndex];
 }
 
 func min64 (x1 int64, x2 int64) int64 {
@@ -101,18 +111,19 @@ func min64 (x1 int64, x2 int64) int64 {
 	}
 }
 
-func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages int64) {
-	var time int64 = *start
+func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
+	var currTime int64 = *start
 	var endTime int64
 	var numPoints uint32
 	if TOTAL_RECORDS < 0 {
 		endTime = 0x7FFFFFFFFFFFFFFF
 	} else {
-		endTime = min64(time + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
+		endTime = min64(currTime + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
 	}
-	var j int64
+	var j uint64
+	var echoTagBase uint64 = uint64(streamID) << orderBitlength
 	for j = 0; j < numMessages; j++ {
-		time = permutation[j]
+		currTime = permutation[j]
 		
 		numPoints = POINTS_PER_MESSAGE
 			
@@ -125,11 +136,11 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 		pointerList := mp.pointerList
 		record := *mp.record
 		
-		request.SetEchoTag(uint64(streamID))
+		request.SetEchoTag(echoTagBase | j)
 		insert.SetUuid(uuid)
 
-		if endTime - time < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
-			numPoints = uint32((endTime - time) / NANOS_BETWEEN_POINTS)
+		if endTime - currTime < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
+			numPoints = uint32((endTime - currTime) / NANOS_BETWEEN_POINTS)
 			rlst := cpint.NewRecordList(segment, int(numPoints))
 			recordList = &rlst;
 			plst := capnp.PointerList(rlst)
@@ -140,14 +151,14 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 
 		var i int
 		for i = 0; uint32(i) < numPoints; i++ {
-		    if DETERMINISTIC_KV {
-		    	record.SetTime(time)
-		    } else {
-				record.SetTime(time + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET))
+			if DETERMINISTIC_KV {
+				record.SetTime(currTime)
+			} else {
+				record.SetTime(currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET))
 			}
-			record.SetValue(get_time_value(time, randGen))
+			record.SetValue(get_time_value(currTime, randGen))
 			pointerList.Set(i, capnp.Object(record))
-			time += NANOS_BETWEEN_POINTS
+			currTime += NANOS_BETWEEN_POINTS
 		}
 		insert.SetValues(*recordList)
 		request.SetInsertValues(*insert)
@@ -157,6 +168,9 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 		sendLock.Lock()
 		_, sendErr = segment.WriteTo(connection)
 		sendLock.Unlock()
+		if GET_MESSAGE_TIMES { // write send time to history
+			history[j].sendTime = time.Now().UnixNano()
+		}
 
 		insertPool.Put(mp)
 		
@@ -190,43 +204,47 @@ var queryPool sync.Pool = sync.Pool{
 	},
 }
 
-func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages int64) {
-	var time int64 = *start
+func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
+	var currTime int64 = *start
 	var endTime int64
 	var numPoints uint32
 	if TOTAL_RECORDS < 0 {
 		endTime = 0x7FFFFFFFFFFFFFFF
 	} else {
-		endTime = min64(time + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
+		endTime = min64(currTime + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
 	}
-	var j int64
+	var j uint64
+	var echoTagBase = uint64(streamID) << orderBitlength
 	for j = 0; j < numMessages; j++ {
-	    time = permutation[j]
-	    
-	    numPoints = POINTS_PER_MESSAGE
-	    
+		currTime = permutation[j]
+		
+		numPoints = POINTS_PER_MESSAGE
+		
 		var mp QueryMessagePart = queryPool.Get().(QueryMessagePart)
 		
 		segment := mp.segment
 		request := mp.request
 		query := mp.query
 		
-		request.SetEchoTag(uint64(streamID))
+		request.SetEchoTag(echoTagBase | j)
 		query.SetUuid(uuid)
-		query.SetStartTime(time)
-		if endTime - time < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
-			numPoints = uint32((endTime - time) / NANOS_BETWEEN_POINTS)
+		query.SetStartTime(currTime)
+		if endTime - currTime < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
+			numPoints = uint32((endTime - currTime) / NANOS_BETWEEN_POINTS)
 		}
 		
 		cont <- numPoints // Blocks if we haven't received enough responses
 		
-		query.SetEndTime(time + NANOS_BETWEEN_POINTS * int64(numPoints))
+		query.SetEndTime(currTime + NANOS_BETWEEN_POINTS * int64(numPoints))
 
 		var sendErr error
 		
 		sendLock.Lock()
 		_, sendErr = segment.WriteTo(connection)
 		sendLock.Unlock()
+		if GET_MESSAGE_TIMES { // write send time to history
+			history[j].sendTime = time.Now().UnixNano()
+		}
 
 		queryPool.Put(mp)
 		
@@ -239,7 +257,7 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 	response <- connID
 }
 
-func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, receivedCounts []uint32, pass *bool, numUsing *int) {
+func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, receivedCounts []uint32, pass *bool, numUsing *int, transactionHistories [][]TransactionData) {
 	for true {
 		/* I've restructured the code so that this is the only goroutine that receives from the connection.
 		   So, the locks aren't necessary anymore. But, I've kept the lock around in case we switch to a different
@@ -258,7 +276,8 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		}
 	
 		responseSeg := cpint.ReadRootResponse(responseSegment)
-		id := responseSeg.EchoTag()
+		echoTag := responseSeg.EchoTag()
+		id := echoTag >> orderBitlength
 		status := responseSeg.StatusCode()
 		
 		var channel chan uint32 = idToChannel[id]
@@ -266,8 +285,11 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		var numPoints uint32
 		
 		if (responseSeg.Final()) {
-		    numPoints = <-channel
+			numPoints = <-channel
 			atomic.AddUint32(&points_received, numPoints)
+			if GET_MESSAGE_TIMES { // write receipt time to history
+				transactionHistories[id][echoTag & orderBitmask].respTime = time.Now().UnixNano()
+			}
 		}
 		
 		if status != cpint.STATUSCODE_OK {
@@ -285,7 +307,7 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 			var received float64 = 0
 			var recTime int64 = 0
 			if responseSeg.Final() {
-			    if num_records + receivedCounts[id] != numPoints {
+				if num_records + receivedCounts[id] != numPoints {
 					fmt.Printf("Expected %v points in query response, but got %v points instead.\n", numPoints, num_records)
 					*pass = false
 				}
@@ -394,9 +416,18 @@ func getServer(uuid []byte) int {
 	return int(uint(uuid[0]) % uint(NUM_SERVERS))
 }
 
+func bitLength(x int64) uint {
+	var times uint = 0
+	for x != 0 {
+		x >>= 1
+		times++
+	}
+	return times
+}
+
 func main() {
 	args := os.Args[1:]
-	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, ConnectionID, chan ConnectionID, int, chan uint32, *rand.Rand, []int64, int64)
+	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, ConnectionID, chan ConnectionID, int, chan uint32, *rand.Rand, []int64, uint64, []TransactionData)
 	var DELETE_POINTS bool = false
 	
 	if len(args) > 0 && args[0] == "-i" {
@@ -469,17 +500,17 @@ func main() {
 		fmt.Println("MAX_TIME_RANDOM_OFFSET must be nonnegative.")
 		os.Exit(1)
 	}
-	if VERIFY_RESPONSES && maxConcurrentMessages > 1 {
-		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.");
+	if VERIFY_RESPONSES && maxConcurrentMessages != 1 {
+		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.")
 		maxConcurrentMessages = 1;
-	}
-	if VERIFY_RESPONSES && PERM_SEED != 0 && !DETERMINISTIC_KV {
-		fmt.Println("ERROR: PERM_SEED must be set to 0 when verifying nondeterministic responses.");
-		return;
 	}
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
 	DETERMINISTIC_KV = (config["DETERMINISTIC_KV"].(string) == "true")
-	
+	if VERIFY_RESPONSES && PERM_SEED != 0 && !DETERMINISTIC_KV {
+		fmt.Println("ERROR: PERM_SEED must be set to 0 when verifying nondeterministic responses.")
+		return;
+	}
+	GET_MESSAGE_TIMES = (config["GET_MESSAGE_TIMES"].(string) == "true")
 	if DETERMINISTIC_KV {
 		get_time_value = getSinusoidValue;
 		for r := 0; r < 100; r++ {
@@ -488,6 +519,18 @@ func main() {
 	} else {
 		get_time_value = getRandValue;
 	}
+	
+	var remainder int64 = 0
+	if TOTAL_RECORDS % int64(POINTS_PER_MESSAGE) != 0 {
+		remainder = 1
+	}
+	var perm_size = (TOTAL_RECORDS / int64(POINTS_PER_MESSAGE)) + remainder
+	orderBitlength = bitLength(perm_size - 1)
+	if orderBitlength + bitLength(int64(NUM_STREAMS - 1)) > 64 {
+		fmt.Println("The number of bits required to store (number of messages - 1) plus the number of bits required to store (NUM_STREAMS - 1) cannot exceed 64.")
+		os.Exit(1)
+	}
+	orderBitmask = (1 << orderBitlength) - 1
 	
 	var seedGen *rand.Rand = rand.New(rand.NewSource(RAND_SEED))
 	var permGen *rand.Rand = rand.New(rand.NewSource(PERM_SEED));
@@ -544,9 +587,9 @@ func main() {
 	
 	for s := range dbAddrs {
 		fmt.Printf("Creating connections to %v...\n", dbAddrs[s])
-	    connections[s] = make([]net.Conn, TCP_CONNECTIONS)
-	    sendLocks[s] = make([]*sync.Mutex, TCP_CONNECTIONS)
-	    recvLocks[s] = make([]*sync.Mutex, TCP_CONNECTIONS)
+		connections[s] = make([]net.Conn, TCP_CONNECTIONS)
+		sendLocks[s] = make([]*sync.Mutex, TCP_CONNECTIONS)
+		recvLocks[s] = make([]*sync.Mutex, TCP_CONNECTIONS)
 		for i := range connections[s] {
 			connections[s][i], err = net.Dial("tcp", dbAddrs[s])
 			if err == nil {
@@ -583,11 +626,19 @@ func main() {
 		pointsReceived = nil
 	}
 	
-	var perm_size = int64(math.Ceil(float64(TOTAL_RECORDS) / float64(POINTS_PER_MESSAGE)))
+	var transactionHistories [][]TransactionData = make([][]TransactionData, NUM_STREAMS)
+	for p := range transactionHistories {
+		if GET_MESSAGE_TIMES {
+			transactionHistories[p] = make([]TransactionData, perm_size)
+		} else {
+			transactionHistories[p] = nil
+		}
+	}	
+	
 	var f int64
 	for e := 0; e < NUM_STREAMS; e++ {
 		perm[e] = make([]int64, perm_size)
-	    if PERM_SEED == 0 {
+		if PERM_SEED == 0 {
 			for f = 0; f < perm_size; f++ {
 				perm[e][f] = FIRST_TIME + NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE) * f
 			}
@@ -599,6 +650,8 @@ func main() {
 		}
 	}
 	fmt.Println("Finished generating insert/query order");
+	
+	var finished bool = false
 	
 	var startTime int64 = time.Now().UnixNano()
 	if DELETE_POINTS {
@@ -617,14 +670,14 @@ func main() {
 			startTimes[z] = FIRST_TIME
 			serverIndex = getServer(uuids[z])
 			connIndex = streamCounts[serverIndex] % TCP_CONNECTIONS
-			go send_messages(uuids[z], &startTimes[z], connections[serverIndex][connIndex], sendLocks[serverIndex][connIndex], ConnectionID{serverIndex, connIndex}, sig, z, cont, randGen, perm[z], perm_size)
+			go send_messages(uuids[z], &startTimes[z], connections[serverIndex][connIndex], sendLocks[serverIndex][connIndex], ConnectionID{serverIndex, connIndex}, sig, z, cont, randGen, perm[z], uint64(perm_size), transactionHistories[z])
 			usingConn[serverIndex][connIndex]++
 			streamCounts[serverIndex]++
 		}
 	
 		for serverIndex = 0; serverIndex < NUM_SERVERS; serverIndex++ {
 			for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
-				go validateResponses(connections[serverIndex][connIndex], recvLocks[serverIndex][connIndex], idToChannel, randGens, startTimes, pointsReceived, &verification_test_pass, &usingConn[serverIndex][connIndex])
+				go validateResponses(connections[serverIndex][connIndex], recvLocks[serverIndex][connIndex], idToChannel, randGens, startTimes, pointsReceived, &verification_test_pass, &usingConn[serverIndex][connIndex], transactionHistories)
 			}
 		}
 		
@@ -642,7 +695,7 @@ func main() {
 		}()
 
 		go func () {
-			for {
+			for !finished {
 				time.Sleep(time.Second)
 				fmt.Printf("Sent %v, ", points_sent)
 				atomic.StoreUint32(&points_sent, 0)
@@ -656,8 +709,8 @@ func main() {
 	var response ConnectionID
 	for k := 0; k < NUM_STREAMS; k++ {
 		response = <-sig
-	    serverIndex = response.serverIndex
-	    connIndex = response.connectionIndex
+		serverIndex = response.serverIndex
+		connIndex = response.connectionIndex
 		usingConn[serverIndex][connIndex]--
 		if usingConn[serverIndex][connIndex] == 0 {
 			connections[serverIndex][connIndex].Close()
@@ -674,11 +727,13 @@ func main() {
 		fmt.Printf("Closed connection %v to server\n", k)
 	}
 	*/
-    
+	
+	finished = true
+	
 	if !DELETE_POINTS {
 		fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
 	}
-	if (VERIFY_RESPONSES) {
+	if VERIFY_RESPONSES {
 		fmt.Printf("%v points are verified to be correct\n", points_verified);
 		if verification_test_pass {
 			fmt.Println("All points were verified to be correct. Test PASSes.")
@@ -692,4 +747,29 @@ func main() {
 	fmt.Printf("Total time: %d nanoseconds for %d points\n", deltaT, TOTAL_RECORDS * int64(NUM_STREAMS))
 	fmt.Printf("Average: %d nanoseconds per point (floored to integer value)\n", deltaT / (TOTAL_RECORDS * int64(NUM_STREAMS)))
 	fmt.Println(deltaT)
+	
+	if GET_MESSAGE_TIMES {
+		file, err := os.Create("stats.json")
+		if err != nil {
+			fmt.Println("Could not write stats to file")
+			os.Exit(1)
+		}
+		writeSafe(file, "{\n")
+		for q := range transactionHistories {
+			writeSafe(file, fmt.Sprintf("\"%v\": [\n", uuid.UUID(uuids[q]).String()))
+			for r := range transactionHistories[q] {
+				writeSafe(file, fmt.Sprintf("[%v,%v],\n", transactionHistories[q][r].sendTime, transactionHistories[q][r].respTime))
+			}
+			writeSafe(file, "]\n")
+		}
+		writeSafe(file, "}\n")
+	}
+}
+
+func writeSafe(file *os.File, str string) {
+	written, err := io.WriteString(file, str)
+	if written != len(str) || err != nil {
+		fmt.Println("Could not write to file")
+		os.Exit(1)
+	}
 }
