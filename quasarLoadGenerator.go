@@ -234,7 +234,7 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 	response <- connID
 }
 
-func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, pass *bool, numUsing *int) {
+func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, receivedCounts []uint32, pass *bool, numUsing *int) {
 	for true {
 		/* I've restructured the code so that this is the only goroutine that receives from the connection.
 		   So, the locks aren't necessary anymore. But, I've kept the lock around in case we switch to a different
@@ -258,13 +258,16 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		
 		var channel chan uint32 = idToChannel[id]
 		
-		var numPoints uint32 = <-channel
+		var numPoints uint32
 		
-		if status == cpint.STATUSCODE_OK {
+		if (responseSeg.Final()) {
+		    numPoints = <-channel
 			atomic.AddUint32(&points_received, numPoints)
-		} else {
+		}
+		
+		if status != cpint.STATUSCODE_OK {
 			fmt.Printf("Quasar returns status code %s!\n", status)
-			os.Exit(1);
+			os.Exit(1)
 		}
 
 		if VERIFY_RESPONSES {
@@ -276,9 +279,14 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 			var expected float64 = 0
 			var received float64 = 0
 			var recTime int64 = 0
-			if num_records != numPoints {
-				fmt.Printf("Expected %v points in query response, but got %v points instead.\n", numPoints, num_records)
-				*pass = false
+			if responseSeg.Final() {
+			    if num_records + receivedCounts[id] != numPoints {
+					fmt.Printf("Expected %v points in query response, but got %v points instead.\n", numPoints, num_records)
+					*pass = false
+				}
+				receivedCounts[id] = 0
+			} else {
+				receivedCounts[id] += num_records
 			}
 			for m := 0; uint32(m) < num_records; m++ {
 				received = records.At(m).Value()
@@ -541,6 +549,12 @@ func main() {
 	var startTimes []int64 = make([]int64, NUM_STREAMS)
 	var verification_test_pass bool = true
 	var perm [][]int64 = make([][]int64, NUM_STREAMS)
+	var pointsReceived []uint32
+	if VERIFY_RESPONSES {
+		pointsReceived = make([]uint32, NUM_STREAMS)
+	} else {
+		pointsReceived = nil
+	}
 	
 	var perm_size = int64(math.Ceil(float64(TOTAL_RECORDS) / float64(POINTS_PER_MESSAGE)))
 	var f int64
@@ -578,7 +592,7 @@ func main() {
 		}
 	
 		for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
-			go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes, &verification_test_pass, &usingConn[connIndex])
+			go validateResponses(connections[connIndex], recvLocks[connIndex], idToChannel, randGens, startTimes, pointsReceived, &verification_test_pass, &usingConn[connIndex])
 		}
 		
 		/* Handle ^C */
