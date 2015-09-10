@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"math/rand"
@@ -34,6 +35,7 @@ var (
 	MAX_TIME_RANDOM_OFFSET float64
 	DETERMINISTIC_KV bool
 	GET_MESSAGE_TIMES bool
+	MAX_CONCURRENT_MESSAGES uint64
 	
 	orderBitlength uint
 	orderBitmask uint64
@@ -113,13 +115,7 @@ func min64 (x1 int64, x2 int64) int64 {
 
 func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
 	var currTime int64 = *start
-	var endTime int64
 	var numPoints uint32
-	if TOTAL_RECORDS < 0 {
-		endTime = 0x7FFFFFFFFFFFFFFF
-	} else {
-		endTime = min64(currTime + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
-	}
 	var j uint64
 	var echoTagBase uint64 = uint64(streamID) << orderBitlength
 	for j = 0; j < numMessages; j++ {
@@ -138,15 +134,8 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 		
 		request.SetEchoTag(echoTagBase | j)
 		insert.SetUuid(uuid)
-
-		if endTime - currTime < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
-			numPoints = uint32((endTime - currTime) / NANOS_BETWEEN_POINTS)
-			rlst := cpint.NewRecordList(segment, int(numPoints))
-			recordList = &rlst;
-			plst := capnp.PointerList(rlst)
-			pointerList = &plst;
-		}
 		
+		// I could put any value into the channel if I wanted to
 		cont <- numPoints // Blocks if we haven't received enough responses
 
 		var i int
@@ -180,6 +169,10 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 		}
 		atomic.AddUint32(&points_sent, uint32(numPoints))
 	}
+	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
+	    // block until everything is fully processed
+	    cont <- 0
+	}
 	response <- connID
 }
 
@@ -206,19 +199,12 @@ var queryPool sync.Pool = sync.Pool{
 
 func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
 	var currTime int64 = *start
-	var endTime int64
-	var numPoints uint32
-	if TOTAL_RECORDS < 0 {
-		endTime = 0x7FFFFFFFFFFFFFFF
-	} else {
-		endTime = min64(currTime + TOTAL_RECORDS * NANOS_BETWEEN_POINTS, 0x7FFFFFFFFFFFFFFF)
-	}
+	var numPoints uint32 = POINTS_PER_MESSAGE
+	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(numPoints)
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
 	for j = 0; j < numMessages; j++ {
 		currTime = permutation[j]
-		
-		numPoints = POINTS_PER_MESSAGE
 		
 		var mp QueryMessagePart = queryPool.Get().(QueryMessagePart)
 		
@@ -229,13 +215,10 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 		request.SetEchoTag(echoTagBase | j)
 		query.SetUuid(uuid)
 		query.SetStartTime(currTime)
-		if endTime - currTime < int64(POINTS_PER_MESSAGE) * NANOS_BETWEEN_POINTS {
-			numPoints = uint32((endTime - currTime) / NANOS_BETWEEN_POINTS)
-		}
-		
+		query.SetEndTime(currTime + messageLength)
+	
+		// I could put any value into the channel if I wanted to
 		cont <- numPoints // Blocks if we haven't received enough responses
-		
-		query.SetEndTime(currTime + NANOS_BETWEEN_POINTS * int64(numPoints))
 
 		var sendErr error
 		
@@ -254,16 +237,21 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 		}
 		atomic.AddUint32(&points_sent, uint32(numPoints))
 	}
+	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
+	    // block until everything is fully processed
+	    cont <- 0
+	}
 	response <- connID
 }
 
 func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, receivedCounts []uint32, pass *bool, numUsing *int, transactionHistories [][]TransactionData) {
+	var buf bytes.Buffer // buffer is sized dynamically
 	for true {
 		/* I've restructured the code so that this is the only goroutine that receives from the connection.
 		   So, the locks aren't necessary anymore. But, I've kept the lock around in case we switch to a different
 		   design later on. */
 		//connLock.Lock()
-		responseSegment, respErr := capnp.ReadFromStream(connection, nil)
+		responseSegment, respErr := capnp.ReadFromStream(connection, &buf)
 		//connLock.Unlock()
 		
 		if *numUsing == 0 {
@@ -278,22 +266,11 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		responseSeg := cpint.ReadRootResponse(responseSegment)
 		echoTag := responseSeg.EchoTag()
 		id := echoTag >> orderBitlength
-		status := responseSeg.StatusCode()
-		
+		var final bool = responseSeg.Final()
 		var channel chan uint32 = idToChannel[id]
 		
-		var numPoints uint32
-		
-		if (responseSeg.Final()) {
-			numPoints = <-channel
-			atomic.AddUint32(&points_received, numPoints)
-			if GET_MESSAGE_TIMES { // write receipt time to history
-				transactionHistories[id][echoTag & orderBitmask].respTime = time.Now().UnixNano()
-			}
-		}
-		
-		if status != cpint.STATUSCODE_OK {
-			fmt.Printf("Quasar returns status code %s!\n", status)
+		if responseSeg.StatusCode() != cpint.STATUSCODE_OK {
+			fmt.Printf("Quasar returns status code %s!\n", responseSeg.StatusCode())
 			os.Exit(1)
 		}
 
@@ -307,8 +284,8 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 			var received float64 = 0
 			var recTime int64 = 0
 			if responseSeg.Final() {
-				if num_records + receivedCounts[id] != numPoints {
-					fmt.Printf("Expected %v points in query response, but got %v points instead.\n", numPoints, num_records)
+				if num_records + receivedCounts[id] != POINTS_PER_MESSAGE {
+					fmt.Printf("Expected %v points in query response, but got %v points instead.\n", POINTS_PER_MESSAGE, num_records)
 					*pass = false
 				}
 				receivedCounts[id] = 0
@@ -333,6 +310,14 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 				currTime = currTime + NANOS_BETWEEN_POINTS
 			}
 			times[id] = currTime;
+		}
+		
+		if final {
+		    <-channel
+		    atomic.AddUint32(&points_received, POINTS_PER_MESSAGE)
+		    if GET_MESSAGE_TIMES {
+				transactionHistories[id][echoTag & orderBitmask].respTime = time.Now().UnixNano()
+			}
 		}
 	}
 }
@@ -362,15 +347,14 @@ func delete_data(uuid []byte, connection net.Conn, sendLock *sync.Mutex, recvLoc
 	segment := *mp.segment
 	request := *mp.request
 	query := *mp.query
-	
 	query.SetUuid(uuid)
 	query.SetStartTime(startTime)
 	query.SetEndTime(endTime)
 	request.SetDeleteValues(query)
 	
-	(*sendLock).Lock()
+	sendLock.Lock()
 	_, sendErr := segment.WriteTo(connection)
-	(*sendLock).Unlock()
+	sendLock.Unlock()
 	
 	deletePool.Put(mp)
 	
@@ -379,9 +363,9 @@ func delete_data(uuid []byte, connection net.Conn, sendLock *sync.Mutex, recvLoc
 		os.Exit(1)
 	}
 	
-	(*recvLock).Lock()
+	recvLock.Lock()
 	responseSegment, respErr := capnp.ReadFromStream(connection, nil)
-	(*recvLock).Unlock()
+	recvLock.Unlock()
 	
 	if respErr != nil {
 		fmt.Printf("Error in receiving response: %v\n", respErr)
@@ -488,6 +472,10 @@ func main() {
 		fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, NUM_STREAMS, and MAX_CONCURRENT_MESSAGES must be positive.")
 		os.Exit(1)
 	}
+	if (TOTAL_RECORDS % int64(POINTS_PER_MESSAGE)) != 0 {
+		fmt.Println("TOTAL_RECORDS must be a multiple of POINTS_PER_MESSAGE.")
+		os.Exit(1)
+	}
 	if timeRandOffset >= NANOS_BETWEEN_POINTS {
 		fmt.Println("MAX_TIME_RANDOM_OFFSET must be less than NANOS_BETWEEN_POINTS.")
 		os.Exit(1)
@@ -504,6 +492,7 @@ func main() {
 		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.")
 		maxConcurrentMessages = 1;
 	}
+	MAX_CONCURRENT_MESSAGES = uint64(maxConcurrentMessages)
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
 	DETERMINISTIC_KV = (config["DETERMINISTIC_KV"].(string) == "true")
 	if VERIFY_RESPONSES && PERM_SEED != 0 && !DETERMINISTIC_KV {
@@ -757,8 +746,12 @@ func main() {
 		writeSafe(file, "{\n")
 		for q := range transactionHistories {
 			writeSafe(file, fmt.Sprintf("\"%v\": [\n", uuid.UUID(uuids[q]).String()))
+			terminator := ","
 			for r := range transactionHistories[q] {
-				writeSafe(file, fmt.Sprintf("[%v,%v],\n", transactionHistories[q][r].sendTime, transactionHistories[q][r].respTime))
+			    if (r == len(transactionHistories[q]) - 1) {
+			        terminator = ""
+			    }
+				writeSafe(file, fmt.Sprintf("[%v,%v]%s\n", transactionHistories[q][r].sendTime, transactionHistories[q][r].respTime, terminator))
 			}
 			writeSafe(file, "]\n")
 		}
