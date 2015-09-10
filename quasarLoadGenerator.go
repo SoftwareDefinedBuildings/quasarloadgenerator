@@ -41,7 +41,7 @@ var (
 	orderBitlength uint
 	orderBitmask uint64
 	statistical bool
-	statisticalBitmask int64
+	statisticalBitmaskUpper int64
 )
 
 var (
@@ -321,7 +321,15 @@ func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *s
 	response <- connID
 }
 
-func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, receivedCounts []uint32, pass *bool, numUsing *int, transactionHistories [][]TransactionData) {
+func getExpTime(currTime int64, randGen *rand.Rand) int64 {
+	if DETERMINISTIC_KV {
+		return currTime
+	} else {
+		return currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
+	}
+}
+
+func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, tempExpTimes []int64, receivedCounts []uint32, pass *bool, numUsing *int, transactionHistories [][]TransactionData) {
 	var buf bytes.Buffer // buffer is sized dynamically
 	for true {
 		/* I've restructured the code so that this is the only goroutine that receives from the connection.
@@ -374,14 +382,11 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 				for m := 0; uint32(m) < num_records; m++ {
 					received = records.At(m).Value()
 					recTime = records.At(m).Time()
-					if DETERMINISTIC_KV {
-						expTime = currTime
-					} else {
-						expTime = currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
-					}
+					expTime = getExpTime(currTime, randGen)
 					expected = get_time_value(recTime, randGens[id])
 					if expTime == recTime && received == expected {
 						atomic.AddUint32(&points_verified, uint32(1))
+						fmt.Printf("Point is correct! (%v, %v)\n", expTime, expected)
 					} else {
 						fmt.Printf("Expected (%v, %v), got (%v, %v)\n", expTime, expected, recTime, received)
 						*pass = false
@@ -389,35 +394,43 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					currTime = currTime + NANOS_BETWEEN_POINTS
 				}
 			} else {
+				fmt.Printf("VERIFYING A NEW MESSAGE\n")
 				records := responseSeg.StatisticalRecords().Values()
 				num_records = uint32(records.Len())
 				var total_count uint64 = 0
-				var expMin float64 = math.Inf(1)
-				var expMean float64 = 0
-				var expMax float64 = math.Inf(-1)
-				var expRecTime int64 = currTime & statisticalBitmask
-				var expectedEnd int64 = expRecTime + (1 << STATISTICAL_PW)
-				var expRecCount uint64 = 0
+				var expMin float64
+				var expMean float64
+				var expMax float64
+				var expRecTime int64
+				var expectedEnd int64
+				var expRecCount uint64
+				expTime = tempExpTimes[id] // we need this early since the pertubation may push it into a different interval
 				for m := 0; uint32(m) < num_records; m++ {
-					for currTime < expectedEnd {
-						if DETERMINISTIC_KV {
-							expTime = currTime
-						} else {
-							expTime = currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
-						}
-						expected = get_time_value(expTime, randGens[id])
+					expRecTime = expTime & statisticalBitmaskUpper
+					expectedEnd = expRecTime + (1 << uint(STATISTICAL_PW))
+					expRecCount = 0
+					expMin = math.Inf(1)
+					expMean = 0
+					expMax = math.Inf(-1)
+					fmt.Println(expTime)
+					//fmt.Println(expectedEnd)
+					for expTime < expectedEnd {
+						expected = get_time_value(expTime, randGen)
 						expMin = math.Min(expected, expMin)
 						expMean += expected
 						expMax = math.Max(expected, expMax)
 						expRecCount++
 						currTime = currTime + NANOS_BETWEEN_POINTS
+						expTime = getExpTime(currTime, randGen)
 					}
+					//fmt.Println(currTime)
 					expMean /= float64(expRecCount)
 					record := records.At(m)
 					if expRecTime == record.Time() && expMin == record.Min() && expMean == record.Mean() && expMax == record.Max() && expRecCount == record.Count() {
 						atomic.AddUint32(&points_verified, uint32(expRecCount))
+						fmt.Printf("Point is correct! (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expRecTime, expMin, expMean, expMax, expRecCount)
 					} else {
-						fmt.Printf("Expected (time=%v, min=%v, mean=%v, max=%v, count=%v), got (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expTime, expMin, expMean, expMax, expRecCount, record.Time(), record.Min(), record.Mean(), record.Max(), record.Count())
+						fmt.Printf("Expected (time=%v, min=%v, mean=%v, max=%v, count=%v), got (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expRecTime, expMin, expMean, expMax, expRecCount, record.Time(), record.Min(), record.Mean(), record.Max(), record.Count())
 						*pass = false
 					}
 					total_count += record.Count()
@@ -431,6 +444,7 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 				} else {
 					receivedCounts[id] += uint32(total_count)
 				}
+				// We still aren't done. We created an extra random number when we found that expTime is out of range, and we need that same expTime next time we receive something (if we generate it again, we will get the wrong result).
 			}
 			times[id] = currTime;
 		}
@@ -620,18 +634,24 @@ func main() {
 		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.")
 		maxConcurrentMessages = 1;
 	}
+	var statisticalBitmaskLower int64
 	if queryMode {
 		if pw >= 0 {
 			STATISTICAL_PW = uint8(pw)
 			statistical = true
-			statisticalBitmask = ^((1 << uint(STATISTICAL_PW)) - 1)
+			statisticalBitmaskLower = (int64(1) << uint(STATISTICAL_PW)) - 1
+			statisticalBitmaskUpper = ^statisticalBitmaskLower
 			send_messages = query_stat_data
 		} else {
 			statistical = false
 			send_messages = query_stand_data
 		}
 	}
-	fmt.Printf("%v %v\n", VERIFY_RESPONSES, statistical)
+	var nanosPerMessage uint64 = uint64(NANOS_BETWEEN_POINTS) * uint64(POINTS_PER_MESSAGE)
+	if VERIFY_RESPONSES && statistical && ((nanosPerMessage & uint64(statisticalBitmaskLower)) != 0 || (FIRST_TIME & statisticalBitmaskLower) != 0) {
+		fmt.Println("ERROR: When verifying statistical responses, NANOS_BETWEEN_POINTS * POINTS_PER_MESSAGE (the ns in each query) and FIRST_TIME must be multiples of 2 ^ STATISTICAL_PW.")
+		return;
+	}
 	MAX_CONCURRENT_MESSAGES = uint64(maxConcurrentMessages)
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
 	DETERMINISTIC_KV = (config["DETERMINISTIC_KV"].(string) == "true")
@@ -749,8 +769,12 @@ func main() {
 	var verification_test_pass bool = true
 	var perm [][]int64 = make([][]int64, NUM_STREAMS)
 	var pointsReceived []uint32
+	var tempExpTimes []int64 = nil
 	if VERIFY_RESPONSES {
 		pointsReceived = make([]uint32, NUM_STREAMS)
+		if statistical {
+			tempExpTimes = make([]int64, NUM_STREAMS)
+		}
 	} else {
 		pointsReceived = nil
 	}
@@ -804,9 +828,15 @@ func main() {
 			streamCounts[serverIndex]++
 		}
 	
+		if VERIFY_RESPONSES && statistical {
+			for v := 0; v < NUM_STREAMS; v++ {
+				tempExpTimes[v] = getExpTime(startTimes[v], randGens[v])
+			}
+		}
+	
 		for serverIndex = 0; serverIndex < NUM_SERVERS; serverIndex++ {
 			for connIndex = 0; connIndex < TCP_CONNECTIONS; connIndex++ {
-				go validateResponses(connections[serverIndex][connIndex], recvLocks[serverIndex][connIndex], idToChannel, randGens, startTimes, pointsReceived, &verification_test_pass, &usingConn[serverIndex][connIndex], transactionHistories)
+				go validateResponses(connections[serverIndex][connIndex], recvLocks[serverIndex][connIndex], idToChannel, randGens, startTimes, tempExpTimes, pointsReceived, &verification_test_pass, &usingConn[serverIndex][connIndex], transactionHistories)
 			}
 		}
 		
