@@ -36,9 +36,12 @@ var (
 	DETERMINISTIC_KV bool
 	GET_MESSAGE_TIMES bool
 	MAX_CONCURRENT_MESSAGES uint64
+	STATISTICAL_PW uint8
 	
 	orderBitlength uint
 	orderBitmask uint64
+	statistical bool
+	statisticalBitmask int64
 )
 
 var (
@@ -181,7 +184,7 @@ type QueryMessagePart struct {
 	query *cpint.CmdQueryStandardValues
 }
 
-var queryPool sync.Pool = sync.Pool{
+var standQueryPool sync.Pool = sync.Pool{
 	New: func () interface{} {
 		var seg *capnp.Segment = capnp.NewBuffer(nil)
 		var req cpint.Request = cpint.NewRootRequest(seg)
@@ -196,52 +199,124 @@ var queryPool sync.Pool = sync.Pool{
 	},
 }
 
-func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
+func query_stand_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
 	var currTime int64 = *start
 	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE)
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
-	
+
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
-	var mp QueryMessagePart = queryPool.Get().(QueryMessagePart)
-		
+	var mp QueryMessagePart = standQueryPool.Get().(QueryMessagePart)
+	
 	segment := mp.segment
 	request := mp.request
 	query := mp.query
-	
+
 	query.SetUuid(uuid)
-		
+	
 	for j = 0; j < numMessages; j++ {
 		currTime = permutation[j]
-		
+	
 		request.SetEchoTag(echoTagBase | j)
 		query.SetStartTime(currTime)
 		query.SetEndTime(currTime + messageLength)
-	
+
 		// I could put any value into the channel if I wanted to
 		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
 
 		var sendErr error
-		
+	
 		sendLock.Lock()
 		_, sendErr = segment.WriteTo(connection)
 		sendLock.Unlock()
 		if GET_MESSAGE_TIMES { // write send time to history
 			history[j].sendTime = time.Now().UnixNano()
 		}
-		
+	
 		if sendErr != nil {
 			fmt.Printf("Error in sending request: %v\n", sendErr)
 			os.Exit(1)
 		}
 		atomic.AddUint32(&points_sent, POINTS_PER_MESSAGE)
 	}
-	
-	queryPool.Put(mp)
-	
+
+	standQueryPool.Put(mp)
+
 	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
-	    // block until everything is fully processed
-	    cont <- 0
+		// block until everything is fully processed
+		cont <- 0
+	}
+	response <- connID
+}
+
+type StatQueryMessagePart struct {
+	segment *capnp.Segment
+	request *cpint.Request
+	query *cpint.CmdQueryStatisticalValues
+}
+
+var statQueryPool sync.Pool = sync.Pool{
+	New: func () interface{} {
+		var seg *capnp.Segment = capnp.NewBuffer(nil)
+		var req cpint.Request = cpint.NewRootRequest(seg)
+		var query cpint.CmdQueryStatisticalValues = cpint.NewCmdQueryStatisticalValues(seg)
+		query.SetVersion(0)
+		query.SetPointWidth(STATISTICAL_PW)
+		req.SetQueryStatisticalValues(query)
+		return StatQueryMessagePart{
+			segment: seg,
+			request: &req,
+			query: &query,
+		}
+	},
+}
+
+func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
+	var currTime int64 = *start
+	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE)
+	var j uint64
+	var echoTagBase = uint64(streamID) << orderBitlength
+
+	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
+	var mp StatQueryMessagePart = statQueryPool.Get().(StatQueryMessagePart)
+	
+	segment := mp.segment
+	request := mp.request
+	query := mp.query
+
+	query.SetUuid(uuid)
+	
+	for j = 0; j < numMessages; j++ {
+		currTime = permutation[j]
+	
+		request.SetEchoTag(echoTagBase | j)
+		query.SetStartTime(currTime)
+		query.SetEndTime(currTime + messageLength)
+
+		// I could put any value into the channel if I wanted to
+		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
+
+		var sendErr error
+	
+		sendLock.Lock()
+		_, sendErr = segment.WriteTo(connection)
+		sendLock.Unlock()
+		if GET_MESSAGE_TIMES { // write send time to history
+			history[j].sendTime = time.Now().UnixNano()
+		}
+	
+		if sendErr != nil {
+			fmt.Printf("Error in sending request: %v\n", sendErr)
+			os.Exit(1)
+		}
+		atomic.AddUint32(&points_sent, POINTS_PER_MESSAGE)
+	}
+
+	statQueryPool.Put(mp)
+
+	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
+		// block until everything is fully processed
+		cont <- 0
 	}
 	response <- connID
 }
@@ -280,36 +355,82 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
    			var randGen *rand.Rand = randGens[id]
 			var currTime int64 = times[id]
 			var expTime int64
-			records := responseSeg.Records().Values()
-			var num_records uint32 = uint32(records.Len())
+			var num_records uint32
 			var expected float64 = 0
-			var received float64 = 0
-			var recTime int64 = 0
-			if responseSeg.Final() {
-				if num_records + receivedCounts[id] != POINTS_PER_MESSAGE {
-					fmt.Printf("Expected %v points in query response, but got %v points instead.\n", POINTS_PER_MESSAGE, num_records)
-					*pass = false
+			if !statistical {
+				records := responseSeg.Records().Values()
+				num_records = uint32(records.Len())
+				var received float64 = 0
+				var recTime int64 = 0
+				if responseSeg.Final() {
+					if num_records + receivedCounts[id] != POINTS_PER_MESSAGE {
+						fmt.Printf("Expected %v points in query response, but got %v points instead.\n", POINTS_PER_MESSAGE, num_records)
+						*pass = false
+					}
+					receivedCounts[id] = 0
+				} else {
+					receivedCounts[id] += num_records
 				}
-				receivedCounts[id] = 0
+				for m := 0; uint32(m) < num_records; m++ {
+					received = records.At(m).Value()
+					recTime = records.At(m).Time()
+					if DETERMINISTIC_KV {
+						expTime = currTime
+					} else {
+						expTime = currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
+					}
+					expected = get_time_value(recTime, randGens[id])
+					if expTime == recTime && received == expected {
+						atomic.AddUint32(&points_verified, uint32(1))
+					} else {
+						fmt.Printf("Expected (%v, %v), got (%v, %v)\n", expTime, expected, recTime, received)
+						*pass = false
+					}
+					currTime = currTime + NANOS_BETWEEN_POINTS
+				}
 			} else {
-				receivedCounts[id] += num_records
-			}
-			for m := 0; uint32(m) < num_records; m++ {
-				received = records.At(m).Value()
-				recTime = records.At(m).Time()
-				if DETERMINISTIC_KV {
-					expTime = currTime
-				} else {
-					expTime = currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
+				records := responseSeg.StatisticalRecords().Values()
+				num_records = uint32(records.Len())
+				var total_count uint64 = 0
+				var expMin float64 = math.Inf(1)
+				var expMean float64 = 0
+				var expMax float64 = math.Inf(-1)
+				var expRecTime int64 = currTime & statisticalBitmask
+				var expectedEnd int64 = expRecTime + (1 << STATISTICAL_PW)
+				var expRecCount uint64 = 0
+				for m := 0; uint32(m) < num_records; m++ {
+					for currTime < expectedEnd {
+						if DETERMINISTIC_KV {
+							expTime = currTime
+						} else {
+							expTime = currTime + int64(randGen.Float64() * MAX_TIME_RANDOM_OFFSET)
+						}
+						expected = get_time_value(expTime, randGens[id])
+						expMin = math.Min(expected, expMin)
+						expMean += expected
+						expMax = math.Max(expected, expMax)
+						expRecCount++
+						currTime = currTime + NANOS_BETWEEN_POINTS
+					}
+					expMean /= float64(expRecCount)
+					record := records.At(m)
+					if expRecTime == record.Time() && expMin == record.Min() && expMean == record.Mean() && expMax == record.Max() && expRecCount == record.Count() {
+						atomic.AddUint32(&points_verified, uint32(expRecCount))
+					} else {
+						fmt.Printf("Expected (time=%v, min=%v, mean=%v, max=%v, count=%v), got (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expTime, expMin, expMean, expMax, expRecCount, record.Time(), record.Min(), record.Mean(), record.Max(), record.Count())
+						*pass = false
+					}
+					total_count += record.Count()
 				}
-				expected = get_time_value(recTime, randGens[id])
-				if expTime == recTime && received == expected {
-					atomic.AddUint32(&points_verified, uint32(1))
+				if responseSeg.Final() {
+					if uint32(total_count) + receivedCounts[id] != POINTS_PER_MESSAGE {
+						fmt.Printf("Expected %v points in query response, but got %v points instead.\n", POINTS_PER_MESSAGE, total_count)
+						*pass = false
+					}
+					receivedCounts[id] = 0
 				} else {
-					fmt.Printf("Expected (%v, %v), got (%v, %v)\n", expTime, expected, recTime, received)
-					*pass = false
+					receivedCounts[id] += uint32(total_count)
 				}
-				currTime = currTime + NANOS_BETWEEN_POINTS
 			}
 			times[id] = currTime;
 		}
@@ -415,16 +536,16 @@ func main() {
 	args := os.Args[1:]
 	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, ConnectionID, chan ConnectionID, int, chan uint32, *rand.Rand, []int64, uint64, []TransactionData)
 	var DELETE_POINTS bool = false
-	
+	var queryMode bool = false
 	if len(args) > 0 && args[0] == "-i" {
 		fmt.Println("Insert mode");
 		send_messages = insert_data
 	} else if len(args) > 0 && args[0] == "-q" {
 		fmt.Println("Query mode");
-		send_messages = query_data
+		queryMode = true
 	} else if len(args) > 0 && args[0] == "-v" {
 		fmt.Println("Query mode with verification");
-		send_messages = query_data
+		queryMode = true
 		VERIFY_RESPONSES = true
 	} else if len(args) > 0 && args[0] == "-d" {
 		fmt.Println("Delete mode")
@@ -470,8 +591,13 @@ func main() {
 	PERM_SEED = getIntFromConfig("PERM_SEED", config)
 	var maxConcurrentMessages int64 = getIntFromConfig("MAX_CONCURRENT_MESSAGES", config);
 	var timeRandOffset int64 = getIntFromConfig("MAX_TIME_RANDOM_OFFSET", config)
+	var pw int64 = getIntFromConfig("STATISTICAL_PW", config);
 	if TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0 {
 		fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, NUM_STREAMS, and MAX_CONCURRENT_MESSAGES must be positive.")
+		os.Exit(1)
+	}
+	if pw < -1 {
+		fmt.Println("STATISTICAL_PW cannot be less than -1.")
 		os.Exit(1)
 	}
 	if (TOTAL_RECORDS % int64(POINTS_PER_MESSAGE)) != 0 {
@@ -494,6 +620,18 @@ func main() {
 		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.")
 		maxConcurrentMessages = 1;
 	}
+	if queryMode {
+		if pw >= 0 {
+			STATISTICAL_PW = uint8(pw)
+			statistical = true
+			statisticalBitmask = ^((1 << uint(STATISTICAL_PW)) - 1)
+			send_messages = query_stat_data
+		} else {
+			statistical = false
+			send_messages = query_stand_data
+		}
+	}
+	fmt.Printf("%v %v\n", VERIFY_RESPONSES, statistical)
 	MAX_CONCURRENT_MESSAGES = uint64(maxConcurrentMessages)
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
 	DETERMINISTIC_KV = (config["DETERMINISTIC_KV"].(string) == "true")
