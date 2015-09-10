@@ -753,7 +753,11 @@ func main() {
 			    }
 				writeSafe(file, fmt.Sprintf("[%v,%v]%s\n", transactionHistories[q][r].sendTime, transactionHistories[q][r].respTime, terminator))
 			}
-			writeSafe(file, "]\n")
+			if q == len(transactionHistories) - 1 {
+				writeSafe(file, "]\n")
+			} else {
+				writeSafe(file, "],\n")
+			}
 		}
 		writeSafe(file, "}\n")
 	}
