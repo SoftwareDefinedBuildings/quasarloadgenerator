@@ -115,7 +115,6 @@ func min64 (x1 int64, x2 int64) int64 {
 
 func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
 	var currTime int64 = *start
-	var numPoints uint32
 	var j uint64
 	var echoTagBase uint64 = uint64(streamID) << orderBitlength
 	
@@ -128,19 +127,16 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 	pointerList := mp.pointerList
 	record := *mp.record
 	
+	insert.SetUuid(uuid)
+	insert.SetValues(*recordList)
+	request.SetInsertValues(*insert)
 	for j = 0; j < numMessages; j++ {
 		currTime = permutation[j]
 		
-		numPoints = POINTS_PER_MESSAGE
-		
 		request.SetEchoTag(echoTagBase | j)
-		insert.SetUuid(uuid)
-		
-		// I could put any value into the channel if I wanted to
-		cont <- numPoints // Blocks if we haven't received enough responses
 
 		var i int
-		for i = 0; uint32(i) < numPoints; i++ {
+		for i = 0; uint32(i) < POINTS_PER_MESSAGE; i++ {
 			if DETERMINISTIC_KV {
 				record.SetTime(currTime)
 			} else {
@@ -150,8 +146,9 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 			pointerList.Set(i, capnp.Object(record))
 			currTime += NANOS_BETWEEN_POINTS
 		}
-		insert.SetValues(*recordList)
-		request.SetInsertValues(*insert)
+		
+		// I could put any value into the channel if I wanted to
+		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
 		
 		var sendErr error
 		
@@ -166,7 +163,7 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 			fmt.Printf("Error in sending request: %v\n", sendErr)
 			return
 		}
-		atomic.AddUint32(&points_sent, uint32(numPoints))
+		atomic.AddUint32(&points_sent, POINTS_PER_MESSAGE)
 	}
 	
 	insertPool.Put(mp)
@@ -201,8 +198,7 @@ var queryPool sync.Pool = sync.Pool{
 
 func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
 	var currTime int64 = *start
-	var numPoints uint32 = POINTS_PER_MESSAGE
-	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(numPoints)
+	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE)
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
 	
@@ -212,17 +208,18 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 	segment := mp.segment
 	request := mp.request
 	query := mp.query
+	
+	query.SetUuid(uuid)
 		
 	for j = 0; j < numMessages; j++ {
 		currTime = permutation[j]
 		
 		request.SetEchoTag(echoTagBase | j)
-		query.SetUuid(uuid)
 		query.SetStartTime(currTime)
 		query.SetEndTime(currTime + messageLength)
 	
 		// I could put any value into the channel if I wanted to
-		cont <- numPoints // Blocks if we haven't received enough responses
+		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
 
 		var sendErr error
 		
@@ -237,7 +234,7 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 			fmt.Printf("Error in sending request: %v\n", sendErr)
 			os.Exit(1)
 		}
-		atomic.AddUint32(&points_sent, uint32(numPoints))
+		atomic.AddUint32(&points_sent, POINTS_PER_MESSAGE)
 	}
 	
 	queryPool.Put(mp)
