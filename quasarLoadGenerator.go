@@ -118,19 +118,20 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 	var numPoints uint32
 	var j uint64
 	var echoTagBase uint64 = uint64(streamID) << orderBitlength
+	
+	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
+	var mp InsertMessagePart = insertPool.Get().(InsertMessagePart)
+	segment := mp.segment
+	request := mp.request
+	insert := mp.insert
+	recordList := mp.recordList;
+	pointerList := mp.pointerList
+	record := *mp.record
+	
 	for j = 0; j < numMessages; j++ {
 		currTime = permutation[j]
 		
 		numPoints = POINTS_PER_MESSAGE
-			
-		var mp InsertMessagePart = insertPool.Get().(InsertMessagePart)
-		
-		segment := mp.segment
-		request := mp.request
-		insert := mp.insert
-		recordList := mp.recordList;
-		pointerList := mp.pointerList
-		record := *mp.record
 		
 		request.SetEchoTag(echoTagBase | j)
 		insert.SetUuid(uuid)
@@ -160,8 +161,6 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 		if GET_MESSAGE_TIMES { // write send time to history
 			history[j].sendTime = time.Now().UnixNano()
 		}
-
-		insertPool.Put(mp)
 		
 		if sendErr != nil {
 			fmt.Printf("Error in sending request: %v\n", sendErr)
@@ -169,6 +168,9 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 		}
 		atomic.AddUint32(&points_sent, uint32(numPoints))
 	}
+	
+	insertPool.Put(mp)
+	
 	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
 	    // block until everything is fully processed
 	    cont <- 0
@@ -203,14 +205,16 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(numPoints)
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
+	
+	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
+	var mp QueryMessagePart = queryPool.Get().(QueryMessagePart)
+		
+	segment := mp.segment
+	request := mp.request
+	query := mp.query
+		
 	for j = 0; j < numMessages; j++ {
 		currTime = permutation[j]
-		
-		var mp QueryMessagePart = queryPool.Get().(QueryMessagePart)
-		
-		segment := mp.segment
-		request := mp.request
-		query := mp.query
 		
 		request.SetEchoTag(echoTagBase | j)
 		query.SetUuid(uuid)
@@ -228,8 +232,6 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 		if GET_MESSAGE_TIMES { // write send time to history
 			history[j].sendTime = time.Now().UnixNano()
 		}
-
-		queryPool.Put(mp)
 		
 		if sendErr != nil {
 			fmt.Printf("Error in sending request: %v\n", sendErr)
@@ -237,6 +239,9 @@ func query_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.M
 		}
 		atomic.AddUint32(&points_sent, uint32(numPoints))
 	}
+	
+	queryPool.Put(mp)
+	
 	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
 	    // block until everything is fully processed
 	    cont <- 0
@@ -709,13 +714,7 @@ func main() {
 	
 	var deltaT int64 = time.Now().UnixNano() - startTime
 	
-	// Close unused connections
-	/*
-	for k := NUM_STREAMS; k < TCP_CONNECTIONS; k++ {
-		connections[k].Close()
-		fmt.Printf("Closed connection %v to server\n", k)
-	}
-	*/
+	// I used to close unused connections here, but now I don't bother
 	
 	finished = true
 	
