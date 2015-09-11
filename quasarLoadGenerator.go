@@ -330,7 +330,7 @@ func getExpTime(currTime int64, randGen *rand.Rand) int64 {
 }
 
 func floatEquals(x float64, y float64) bool {
-	return math.Abs((x - y) / (x * y)) < 1e-12
+	return math.Abs(x - y) < 1e-14 * math.Max(math.Abs(x), math.Abs(y))
 }
 
 func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, tempExpTimes []int64, receivedCounts []uint32, pass *bool, numUsing *int, transactionHistories [][]TransactionData) {
