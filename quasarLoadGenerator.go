@@ -41,6 +41,7 @@ var (
 	orderBitlength uint
 	orderBitmask uint64
 	statistical bool
+	statisticalBitmaskLower int64
 	statisticalBitmaskUpper int64
 )
 
@@ -150,7 +151,6 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 			currTime += NANOS_BETWEEN_POINTS
 		}
 		
-		// I could put any value into the channel if I wanted to
 		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
 		
 		var sendErr error
@@ -221,7 +221,6 @@ func query_stand_data(uuid []byte, start *int64, connection net.Conn, sendLock *
 		query.SetStartTime(currTime)
 		query.SetEndTime(currTime + messageLength)
 
-		// I could put any value into the channel if I wanted to
 		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
 
 		var sendErr error
@@ -286,6 +285,8 @@ func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *s
 
 	query.SetUuid(uuid)
 	
+	var recordsPerMessage uint32 = uint32(messageLength >> STATISTICAL_PW)
+	
 	for j = 0; j < numMessages; j++ {
 		currTime = permutation[j]
 	
@@ -293,8 +294,7 @@ func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *s
 		query.SetStartTime(currTime)
 		query.SetEndTime(currTime + messageLength)
 
-		// I could put any value into the channel if I wanted to
-		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
+		cont <- recordsPerMessage // Blocks if we haven't received enough responses
 
 		var sendErr error
 	
@@ -309,7 +309,7 @@ func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *s
 			fmt.Printf("Error in sending request: %v\n", sendErr)
 			os.Exit(1)
 		}
-		atomic.AddUint32(&points_sent, POINTS_PER_MESSAGE)
+		atomic.AddUint32(&points_sent, recordsPerMessage)
 	}
 
 	statQueryPool.Put(mp)
@@ -412,7 +412,7 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					expMin = math.Inf(1)
 					expMean = 0
 					expMax = math.Inf(-1)
-					fmt.Println(expTime)
+					//fmt.Println(expTime)
 					//fmt.Println(expectedEnd)
 					for expTime < expectedEnd {
 						expected = get_time_value(expTime, randGen)
@@ -428,7 +428,7 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					record := records.At(m)
 					if expRecTime == record.Time() && expMin == record.Min() && expMean == record.Mean() && expMax == record.Max() && expRecCount == record.Count() {
 						atomic.AddUint32(&points_verified, uint32(expRecCount))
-						fmt.Printf("Point is correct! (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expRecTime, expMin, expMean, expMax, expRecCount)
+						//fmt.Printf("Point is correct! (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expRecTime, expMin, expMean, expMax, expRecCount)
 					} else {
 						fmt.Printf("Expected (time=%v, min=%v, mean=%v, max=%v, count=%v), got (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expRecTime, expMin, expMean, expMax, expRecCount, record.Time(), record.Min(), record.Mean(), record.Max(), record.Count())
 						*pass = false
@@ -450,9 +450,8 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		}
 		
 		if final {
-		    <-channel
-		    atomic.AddUint32(&points_received, POINTS_PER_MESSAGE)
-		    if GET_MESSAGE_TIMES {
+			atomic.AddUint32(&points_received, <-channel)
+			if GET_MESSAGE_TIMES {
 				transactionHistories[id][echoTag & orderBitmask].respTime = time.Now().UnixNano()
 			}
 		}
@@ -634,7 +633,6 @@ func main() {
 		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.")
 		maxConcurrentMessages = 1;
 	}
-	var statisticalBitmaskLower int64
 	if queryMode {
 		if pw >= 0 {
 			STATISTICAL_PW = uint8(pw)
@@ -897,8 +895,14 @@ func main() {
 	} else {
 		fmt.Println("Finished")
 	}
-	fmt.Printf("Total time: %d nanoseconds for %d points\n", deltaT, TOTAL_RECORDS * int64(NUM_STREAMS))
-	fmt.Printf("Average: %d nanoseconds per point (floored to integer value)\n", deltaT / (TOTAL_RECORDS * int64(NUM_STREAMS)))
+	
+	var numResPoints uint64 = uint64(TOTAL_RECORDS) * uint64(NUM_STREAMS)
+	fmt.Printf("Total time: %d nanoseconds for %d points\n", deltaT, numResPoints)
+	var average uint64 = 0
+	if numResPoints != 0 {
+		average = uint64(deltaT) / numResPoints
+	}
+	fmt.Printf("Average: %d nanoseconds per point (floored to integer value)\n", average)
 	fmt.Println(deltaT)
 	
 	if GET_MESSAGE_TIMES {
