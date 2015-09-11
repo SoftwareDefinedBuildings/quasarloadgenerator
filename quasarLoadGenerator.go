@@ -329,6 +329,10 @@ func getExpTime(currTime int64, randGen *rand.Rand) int64 {
 	}
 }
 
+func floatEquals(x float64, y float64) bool {
+	return math.Abs((x - y) / (x * y)) < 1e-12
+}
+
 func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []chan uint32, randGens []*rand.Rand, times []int64, tempExpTimes []int64, receivedCounts []uint32, pass *bool, numUsing *int, transactionHistories [][]TransactionData) {
 	var buf bytes.Buffer // buffer is sized dynamically
 	for true {
@@ -386,7 +390,6 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					expected = get_time_value(recTime, randGens[id])
 					if expTime == recTime && received == expected {
 						atomic.AddUint32(&points_verified, uint32(1))
-						fmt.Printf("Point is correct! (%v, %v)\n", expTime, expected)
 					} else {
 						fmt.Printf("Expected (%v, %v), got (%v, %v)\n", expTime, expected, recTime, received)
 						*pass = false
@@ -394,7 +397,6 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					currTime = currTime + NANOS_BETWEEN_POINTS
 				}
 			} else {
-				fmt.Printf("VERIFYING A NEW MESSAGE\n")
 				records := responseSeg.StatisticalRecords().Values()
 				num_records = uint32(records.Len())
 				var total_count uint64 = 0
@@ -412,8 +414,7 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					expMin = math.Inf(1)
 					expMean = 0
 					expMax = math.Inf(-1)
-					//fmt.Println(expTime)
-					//fmt.Println(expectedEnd)
+
 					for expTime < expectedEnd {
 						expected = get_time_value(expTime, randGen)
 						expMin = math.Min(expected, expMin)
@@ -423,12 +424,10 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 						currTime = currTime + NANOS_BETWEEN_POINTS
 						expTime = getExpTime(currTime, randGen)
 					}
-					//fmt.Println(currTime)
 					expMean /= float64(expRecCount)
 					record := records.At(m)
-					if expRecTime == record.Time() && expMin == record.Min() && expMean == record.Mean() && expMax == record.Max() && expRecCount == record.Count() {
+					if expRecTime == record.Time() && floatEquals(expMin, record.Min()) && floatEquals(expMean, record.Mean()) && floatEquals(expMax, record.Max()) && expRecCount == record.Count() {
 						atomic.AddUint32(&points_verified, uint32(expRecCount))
-						//fmt.Printf("Point is correct! (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expRecTime, expMin, expMean, expMax, expRecCount)
 					} else {
 						fmt.Printf("Expected (time=%v, min=%v, mean=%v, max=%v, count=%v), got (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expRecTime, expMin, expMean, expMax, expRecCount, record.Time(), record.Min(), record.Mean(), record.Max(), record.Count())
 						*pass = false
@@ -445,6 +444,7 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					receivedCounts[id] += uint32(total_count)
 				}
 				// We still aren't done. We created an extra random number when we found that expTime is out of range, and we need that same expTime next time we receive something (if we generate it again, we will get the wrong result).
+				tempExpTimes[id] = expTime
 			}
 			times[id] = currTime;
 		}
