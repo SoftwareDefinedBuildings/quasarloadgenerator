@@ -1,0 +1,7 @@
+QUASAR/BTrDB Load Generator
+===========================
+
+If NANOTIME_PER_MESSAGE is 0, then sends as fast as possible.
+If NANOTIME_PER_MESSAGE is > 0, and MAX_CONCURRENT_MESSAGES is 1, then messages are sent at a fixed interval in blocking mode.
+If NANOTIME_PER_MESSAGE is > 0, and MAX_CONCURRENT_MESSAGES is 0, then messages are sent at a fixed interval in non-blocking mode.
+If NANOTIME_PER_MESSAGE is > 0, then the -v option won't work.

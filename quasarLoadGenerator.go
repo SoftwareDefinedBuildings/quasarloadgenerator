@@ -37,12 +37,15 @@ var (
 	GET_MESSAGE_TIMES bool
 	MAX_CONCURRENT_MESSAGES uint64
 	STATISTICAL_PW uint8
+	NANOTIME_PER_MESSAGE int64
 	
 	orderBitlength uint
 	orderBitmask uint64
 	statistical bool
 	statisticalBitmaskLower int64
 	statisticalBitmaskUpper int64
+	rateLimited bool
+	blocking bool
 )
 
 var (
@@ -117,11 +120,19 @@ func min64 (x1 int64, x2 int64) int64 {
 	}
 }
 
+func makeTicker() *time.Ticker {
+	if rateLimited {
+		return time.NewTicker(time.Duration(NANOTIME_PER_MESSAGE))
+	}
+	return nil
+}
+
 func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
 	var currTime int64 = *start
 	var j uint64
 	var echoTagBase uint64 = uint64(streamID) << orderBitlength
-	
+	var ticker *time.Ticker = makeTicker()
+
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
 	var mp InsertMessagePart = insertPool.Get().(InsertMessagePart)
 	segment := mp.segment
@@ -151,7 +162,12 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 			currTime += NANOS_BETWEEN_POINTS
 		}
 		
-		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
+		if rateLimited {
+			<-ticker.C
+		}
+		if blocking {
+			cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
+		}
 		
 		var sendErr error
 		
@@ -204,6 +220,7 @@ func query_stand_data(uuid []byte, start *int64, connection net.Conn, sendLock *
 	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE)
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
+	var ticker *time.Ticker = makeTicker()
 
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
 	var mp QueryMessagePart = standQueryPool.Get().(QueryMessagePart)
@@ -221,8 +238,13 @@ func query_stand_data(uuid []byte, start *int64, connection net.Conn, sendLock *
 		query.SetStartTime(currTime)
 		query.SetEndTime(currTime + messageLength)
 
-		cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
-
+		if rateLimited {
+			<-ticker.C
+		}
+		if blocking {
+			cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
+		}
+		
 		var sendErr error
 	
 		sendLock.Lock()
@@ -275,6 +297,7 @@ func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *s
 	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE)
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
+	var ticker *time.Ticker = makeTicker()
 
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
 	var mp StatQueryMessagePart = statQueryPool.Get().(StatQueryMessagePart)
@@ -294,8 +317,13 @@ func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *s
 		query.SetStartTime(currTime)
 		query.SetEndTime(currTime + messageLength)
 
-		cont <- recordsPerMessage // Blocks if we haven't received enough responses
-
+		if rateLimited {
+			<-ticker.C
+		}
+		if blocking {
+			cont <- POINTS_PER_MESSAGE // Blocks if we haven't received enough responses
+		}
+		
 		var sendErr error
 	
 		sendLock.Lock()
@@ -450,7 +478,11 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		}
 		
 		if final {
-			atomic.AddUint32(&points_received, <-channel)
+			if blocking {
+				atomic.AddUint32(&points_received, <-channel)
+			} else {
+				atomic.AddUint32(&points_received, POINTS_PER_MESSAGE)
+			}
 			if GET_MESSAGE_TIMES {
 				transactionHistories[id][echoTag & orderBitmask].respTime = time.Now().UnixNano()
 			}
@@ -602,11 +634,16 @@ func main() {
 	FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
 	RAND_SEED = getIntFromConfig("RAND_SEED", config)
 	PERM_SEED = getIntFromConfig("PERM_SEED", config)
-	var maxConcurrentMessages int64 = getIntFromConfig("MAX_CONCURRENT_MESSAGES", config);
+	NANOTIME_PER_MESSAGE = getIntFromConfig("NANOTIME_PER_MESSAGE", config)
+	var maxConcurrentMessages int64 = getIntFromConfig("MAX_CONCURRENT_MESSAGES", config)
 	var timeRandOffset int64 = getIntFromConfig("MAX_TIME_RANDOM_OFFSET", config)
 	var pw int64 = getIntFromConfig("STATISTICAL_PW", config);
-	if TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0 {
+	if TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || (NANOTIME_PER_MESSAGE == 0 && maxConcurrentMessages <= 0) {
 		fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, NUM_STREAMS, and MAX_CONCURRENT_MESSAGES must be positive.")
+		os.Exit(1)
+	}
+	if NANOTIME_PER_MESSAGE < 0 {
+		fmt.Println("NANOTIME_PER_MESSAGE cannot be negative.")
 		os.Exit(1)
 	}
 	if pw < -1 {
@@ -629,9 +666,24 @@ func main() {
 		fmt.Println("MAX_TIME_RANDOM_OFFSET must be nonnegative.")
 		os.Exit(1)
 	}
+	if NANOTIME_PER_MESSAGE > 0 && maxConcurrentMessages != 0 && maxConcurrentMessages != 1 {
+		fmt.Println("If NANOTIME_PER_MESSAGE > 0, then MAX_CONCURRENT_MESSAGES must be either 0 or 1.")
+		os.Exit(1)
+	}
+	if VERIFY_RESPONSES && NANOTIME_PER_MESSAGE != 0 {
+		fmt.Println("ERROR: When verifying responses, NANOTIME_PER_MESSAGE must be 0.")
+		os.Exit(1)
+	}
 	if VERIFY_RESPONSES && maxConcurrentMessages != 1 {
 		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.")
 		maxConcurrentMessages = 1;
+	}
+	if NANOTIME_PER_MESSAGE > 0 {
+		rateLimited = true
+		blocking = (MAX_CONCURRENT_MESSAGES == 1)
+	} else {
+		rateLimited = false
+		blocking = false
 	}
 	if queryMode {
 		if pw >= 0 {
