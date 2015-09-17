@@ -120,15 +120,8 @@ func min64 (x1 int64, x2 int64) int64 {
 	}
 }
 
-func makeTicker() *time.Ticker {
-	if rateLimited {
-		return time.NewTicker(time.Duration(NANOTIME_PER_MESSAGE))
-	}
-	return nil
-}
-
 func fillChannelIfNotBlocking(cont chan uint32, numMessages uint64) {
-	if !blocking {
+	if rateLimited && !blocking {
 		go func() {
 			var j uint64
 			for j = 0; j < numMessages; j++ {
@@ -138,11 +131,10 @@ func fillChannelIfNotBlocking(cont chan uint32, numMessages uint64) {
 	}
 }
 
-func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
+func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData, ticker *time.Ticker) {
 	var currTime int64 = *start
 	var j uint64
 	var echoTagBase uint64 = uint64(streamID) << orderBitlength
-	var ticker *time.Ticker = makeTicker()
 	fillChannelIfNotBlocking(cont, numMessages)
 
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
@@ -228,12 +220,11 @@ var standQueryPool sync.Pool = sync.Pool{
 	},
 }
 
-func query_stand_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
+func query_stand_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData, ticker *time.Ticker) {
 	var currTime int64 = *start
 	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE)
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
-	var ticker *time.Ticker = makeTicker()
 	fillChannelIfNotBlocking(cont, numMessages)
 
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
@@ -306,12 +297,11 @@ var statQueryPool sync.Pool = sync.Pool{
 	},
 }
 
-func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
+func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData, ticker *time.Ticker) {
 	var currTime int64 = *start
 	var messageLength int64 = NANOS_BETWEEN_POINTS * int64(POINTS_PER_MESSAGE)
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
-	var ticker *time.Ticker = makeTicker()
 	fillChannelIfNotBlocking(cont, numMessages)
 
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
@@ -590,7 +580,7 @@ func bitLength(x int64) uint {
 
 func main() {
 	args := os.Args[1:]
-	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, ConnectionID, chan ConnectionID, int, chan uint32, *rand.Rand, []int64, uint64, []TransactionData)
+	var send_messages func([]byte, *int64, net.Conn, *sync.Mutex, ConnectionID, chan ConnectionID, int, chan uint32, *rand.Rand, []int64, uint64, []TransactionData, *time.Ticker)
 	var DELETE_POINTS bool = false
 	var queryMode bool = false
 	if len(args) > 0 && args[0] == "-i" {
@@ -694,7 +684,7 @@ func main() {
 		blocking = (maxConcurrentMessages == 1)
 	} else {
 		rateLimited = false
-		blocking = false
+		blocking = true
 	}
 	if queryMode {
 		if pw >= 0 {
@@ -713,7 +703,7 @@ func main() {
 		fmt.Println("ERROR: When verifying statistical responses, NANOS_BETWEEN_POINTS * POINTS_PER_MESSAGE (the ns in each query) and FIRST_TIME must be multiples of 2 ^ STATISTICAL_PW.")
 		return;
 	}
-	if !blocking {
+	if rateLimited && !blocking {
 		maxConcurrentMessages = 128 // we want a reasonably large buffer for how many messages we can be behind without slowing down
 	}
 	MAX_CONCURRENT_MESSAGES = uint64(maxConcurrentMessages)
@@ -866,7 +856,21 @@ func main() {
 			}
 		}
 	}
-	fmt.Println("Finished generating insert/query order");
+	fmt.Println("Finished generating insert/query order")
+	
+	var nanotime = time.Duration(NANOTIME_PER_MESSAGE)
+	var nanotimeStaggered = time.Duration(NANOTIME_PER_MESSAGE / int64(NUM_STREAMS))
+	var tickers []*time.Ticker = make([]*time.Ticker, NUM_STREAMS)
+	var baseTicker *time.Ticker
+	if rateLimited {
+		baseTicker = time.NewTicker(nanotimeStaggered)
+		for t := 0; t < NUM_STREAMS; t++ {
+			<-baseTicker.C
+			tickers[t] = time.NewTicker(nanotime)
+		}
+		baseTicker.Stop()
+	}
+	fmt.Println("Finished generating Tickers")
 	
 	var finished bool = false
 	
@@ -887,7 +891,7 @@ func main() {
 			startTimes[z] = FIRST_TIME
 			serverIndex = getServer(uuids[z])
 			connIndex = streamCounts[serverIndex] % TCP_CONNECTIONS
-			go send_messages(uuids[z], &startTimes[z], connections[serverIndex][connIndex], sendLocks[serverIndex][connIndex], ConnectionID{serverIndex, connIndex}, sig, z, cont, randGen, perm[z], uint64(perm_size), transactionHistories[z])
+			go send_messages(uuids[z], &startTimes[z], connections[serverIndex][connIndex], sendLocks[serverIndex][connIndex], ConnectionID{serverIndex, connIndex}, sig, z, cont, randGen, perm[z], uint64(perm_size), transactionHistories[z], tickers[z])
 			usingConn[serverIndex][connIndex]++
 			streamCounts[serverIndex]++
 		}
