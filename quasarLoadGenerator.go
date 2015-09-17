@@ -127,11 +127,23 @@ func makeTicker() *time.Ticker {
 	return nil
 }
 
+func fillChannelIfNotBlocking(cont chan uint32, numMessages uint64) {
+	if !blocking {
+		go func() {
+			var j uint64
+			for j = 0; j < numMessages; j++ {
+				cont <- POINTS_PER_MESSAGE
+			}
+		}()
+	}
+}
+
 func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID, streamID int, cont chan uint32, randGen *rand.Rand, permutation []int64, numMessages uint64, history []TransactionData) {
 	var currTime int64 = *start
 	var j uint64
 	var echoTagBase uint64 = uint64(streamID) << orderBitlength
 	var ticker *time.Ticker = makeTicker()
+	fillChannelIfNotBlocking(cont, numMessages)
 
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
 	var mp InsertMessagePart = insertPool.Get().(InsertMessagePart)
@@ -145,6 +157,7 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 	insert.SetUuid(uuid)
 	insert.SetValues(*recordList)
 	request.SetInsertValues(*insert)
+	
 	for j = 0; j < numMessages; j++ {
 		currTime = permutation[j]
 		
@@ -188,7 +201,7 @@ func insert_data(uuid []byte, start *int64, connection net.Conn, sendLock *sync.
 	insertPool.Put(mp)
 	
 	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
-	    // block until everything is fully processed
+	    // block until everything is fully processed, even if we are in non-blocking mode
 	    cont <- 0
 	}
 	response <- connID
@@ -221,6 +234,7 @@ func query_stand_data(uuid []byte, start *int64, connection net.Conn, sendLock *
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
 	var ticker *time.Ticker = makeTicker()
+	fillChannelIfNotBlocking(cont, numMessages)
 
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
 	var mp QueryMessagePart = standQueryPool.Get().(QueryMessagePart)
@@ -264,7 +278,7 @@ func query_stand_data(uuid []byte, start *int64, connection net.Conn, sendLock *
 	standQueryPool.Put(mp)
 
 	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
-		// block until everything is fully processed
+		// block until everything is fully processed, even if we are in non-blocking mode
 		cont <- 0
 	}
 	response <- connID
@@ -298,6 +312,7 @@ func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *s
 	var j uint64
 	var echoTagBase = uint64(streamID) << orderBitlength
 	var ticker *time.Ticker = makeTicker()
+	fillChannelIfNotBlocking(cont, numMessages)
 
 	// I used to get from the pool and put it back every iteration. Now I just get it once and keep it.
 	var mp StatQueryMessagePart = statQueryPool.Get().(StatQueryMessagePart)
@@ -343,7 +358,7 @@ func query_stat_data(uuid []byte, start *int64, connection net.Conn, sendLock *s
 	statQueryPool.Put(mp)
 
 	for j = 0; j < MAX_CONCURRENT_MESSAGES; j++ {
-		// block until everything is fully processed
+		// block until everything is fully processed, even if we are in non-blocking mode
 		cont <- 0
 	}
 	response <- connID
@@ -478,11 +493,7 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 		}
 		
 		if final {
-			if blocking {
-				atomic.AddUint32(&points_received, <-channel)
-			} else {
-				atomic.AddUint32(&points_received, POINTS_PER_MESSAGE)
-			}
+			atomic.AddUint32(&points_received, <-channel)
 			if GET_MESSAGE_TIMES {
 				transactionHistories[id][echoTag & orderBitmask].respTime = time.Now().UnixNano()
 			}
@@ -680,7 +691,7 @@ func main() {
 	}
 	if NANOTIME_PER_MESSAGE > 0 {
 		rateLimited = true
-		blocking = (MAX_CONCURRENT_MESSAGES == 1)
+		blocking = (maxConcurrentMessages == 1)
 	} else {
 		rateLimited = false
 		blocking = false
@@ -701,6 +712,9 @@ func main() {
 	if VERIFY_RESPONSES && statistical && ((nanosPerMessage & uint64(statisticalBitmaskLower)) != 0 || (FIRST_TIME & statisticalBitmaskLower) != 0) {
 		fmt.Println("ERROR: When verifying statistical responses, NANOS_BETWEEN_POINTS * POINTS_PER_MESSAGE (the ns in each query) and FIRST_TIME must be multiples of 2 ^ STATISTICAL_PW.")
 		return;
+	}
+	if !blocking {
+		maxConcurrentMessages = 128 // we want a reasonably large buffer for how many messages we can be behind without slowing down
 	}
 	MAX_CONCURRENT_MESSAGES = uint64(maxConcurrentMessages)
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
