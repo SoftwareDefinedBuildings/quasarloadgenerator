@@ -47,6 +47,7 @@ var (
 
 var (
 	VERIFY_RESPONSES = false
+	PRINT_ALL = false
 )
 
 var points_sent uint32 = 0
@@ -390,6 +391,9 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					expected = get_time_value(recTime, randGens[id])
 					if expTime == recTime && received == expected {
 						atomic.AddUint32(&points_verified, uint32(1))
+						if PRINT_ALL {
+							fmt.Printf("Received expected point (%v, %v)\n", recTime, received)
+						}
 					} else {
 						fmt.Printf("Expected (%v, %v), got (%v, %v)\n", expTime, expected, recTime, received)
 						*pass = false
@@ -428,6 +432,9 @@ func validateResponses(connection net.Conn, connLock *sync.Mutex, idToChannel []
 					record := records.At(m)
 					if expRecTime == record.Time() && floatEquals(expMin, record.Min()) && floatEquals(expMean, record.Mean()) && floatEquals(expMax, record.Max()) && expRecCount == record.Count() {
 						atomic.AddUint32(&points_verified, uint32(expRecCount))
+						if PRINT_ALL {
+							fmt.Printf("Received record (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", record.Time(), record.Min(), record.Mean(), record.Max(), record.Count())
+						}
 					} else {
 						fmt.Printf("Expected (time=%v, min=%v, mean=%v, max=%v, count=%v), got (time=%v, min=%v, mean=%v, max=%v, count=%v)\n", expRecTime, expMin, expMean, expMax, expRecCount, record.Time(), record.Min(), record.Mean(), record.Max(), record.Count())
 						*pass = false
@@ -560,6 +567,11 @@ func main() {
 		fmt.Println("Query mode with verification");
 		queryMode = true
 		VERIFY_RESPONSES = true
+	} else if len(args) > 0 && args[0] == "-p" {
+		fmt.Println("Query mode with \"print all\" verification");
+		queryMode = true
+		VERIFY_RESPONSES = true
+		PRINT_ALL = true
 	} else if len(args) > 0 && args[0] == "-d" {
 		fmt.Println("Delete mode")
 		DELETE_POINTS = true
