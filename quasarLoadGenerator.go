@@ -16,10 +16,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	
+	"github.com/pborman/uuid"
 	cparse "github.com/SoftwareDefinedBuildings/sync2_quasar/configparser"
 	cpint "github.com/SoftwareDefinedBuildings/btrdb/cpinterface"
 	capnp "github.com/glycerine/go-capnproto"
-	uuid "code.google.com/p/go-uuid/uuid"
 )
 
 var (
